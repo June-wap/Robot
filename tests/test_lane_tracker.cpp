@@ -1,9 +1,9 @@
 #include <cstdio>
 #include <cmath>
 #include <cstring>
-#include "../esp32_robot/LaneTypes.h"
-#include "../esp32_robot/CoveragePlanner.h"
-#include "../esp32_robot/LaneTracker.h"
+#include "../esp32_robot/src/planning/LaneTypes.h"
+#include "../esp32_robot/src/planning/CoveragePlanner.h"
+#include "../esp32_robot/src/planning/LaneTracker.h"
 
 static int gPassed = 0;
 static int gFailed = 0;

@@ -3,8 +3,8 @@
 #include <limits>
 #include <chrono>
 #include <cstring>
-#include "../esp32_robot/LaneTypes.h"
-#include "../esp32_robot/CoveragePlanner.h"
+#include "../esp32_robot/src/planning/LaneTypes.h"
+#include "../esp32_robot/src/planning/CoveragePlanner.h"
 
 static int gPassed = 0;
 static int gFailed = 0;

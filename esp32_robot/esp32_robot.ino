@@ -41,9 +41,9 @@
 #include <Preferences.h>
 #include <math.h>
 #include <stdlib.h>
-#include "LaneTypes.h"
-#include "CoveragePlanner.h"
-#include "LaneTracker.h"
+#include "src/planning/LaneTypes.h"
+#include "src/planning/CoveragePlanner.h"
+#include "src/planning/LaneTracker.h"
 #include "src/config/HardwareConfig.h"
 #include "src/config/RobotConfig.h"
 #include "src/config/NetworkConfig.h"
