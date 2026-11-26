@@ -39,15 +39,15 @@
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
-#include <vector>
 #include <math.h>
+#include <stdlib.h>
+#include "LaneTypes.h"
+#include "CoveragePlanner.h"
+#include "LaneTracker.h"
 
 // Khai báo kiểu dữ liệu trước mọi hàm để Arduino IDE sinh prototype chính xác
 struct Wall { bool ok; float dist; float phi; };
 enum State { ST_IDLE, ST_CALIB, ST_RUN, ST_DONE, ST_ERR };
-enum StepType { GO_X, GO_Y };
-enum StepRole { ROLE_HOME, ROLE_LANE, ROLE_SHIFT, ROLE_RECOVER, ROLE_PERIM };
-struct Step { StepType type; float val; StepRole role; };
 enum Phase { PH_TURN, PH_DRIVE, PH_BACKOFF };
 
 // ======================= WIFI =======================
@@ -102,17 +102,14 @@ const int US_ECHO[3] = {26, 14, 33};
 #define US_TIMEOUT_MS      14    // ~2.4 m, không block CPU
 #define US_PERIOD_MS       30
 #define BLOCK_CONFIRM_CNT  3     // 3 chu kỳ dữ liệu cảm biến thực liên tiếp
-#define LANE_OVERLAP_RATIO 0.15f // Chồng lấn tối thiểu 15% giữa 2 làn liên tiếp
-#define RECOVER_MIN_REM_MM 450.0f // Chèn bước bọc lại nếu phần làn bỏ sót > 450 mm
-#define MAX_PLAN_STEPS     200
+#define DEF_OVERLAP_PCT    10.0f // Chế độ STANDARD = 10% (phạm vi 0..30%)
 
 // ======================= BIẾN TOÀN CỤC =======================
 WebServer server(80);
 State state = ST_IDLE;
 
-std::vector<Step> steps;
-std::vector<float> planLanes;
-bool planAxisY = true;           // true: quét làn dọc trục Y, false: dọc trục X
+CoveragePlan activePlan;
+LaneTracker  laneTracker;
 int  stepIdx = 0;
 bool stepStarted = false;
 Phase phase = PH_TURN;
@@ -175,7 +172,8 @@ Preferences prefs;
 float cfgMopWidth = DEF_MOP_WIDTH_MM;
 int   cfgCruise   = DEF_CRUISE_PWM;
 int   cfgEdge     = DEF_EDGE_MM;
-bool  cfgPerim    = true;        // Lau viền 2 cạnh đầu/cuối làn sau khi quét xong
+float cfgOverlap  = DEF_OVERLAP_PCT;
+CleaningDirection cfgDirection = DIRECTION_AUTO;
 String myIP = "";
 
 // ======================= TRANG WEB =======================
@@ -213,7 +211,8 @@ canvas{background:#000;border:1px solid #333;border-radius:8px;max-width:100%}
 <div class="row">Bề rộng vệt lau (mm) <input id="sMop" type="number" min="100" max="400" style="width:80px"></div>
 <div class="row">Tốc độ lau (PWM 100-210) <input id="sCr" type="number" min="100" max="210" style="width:80px"></div>
 <div class="row">Cách tường (mm) <input id="sEd" type="number" min="180" max="500" style="width:80px"></div>
-<div class="row"><label><input id="sPer" type="checkbox" checked> Lau viền 2 đầu sau khi quét làn</label></div>
+<div class="row">Chồng lấn (0-30%) <input id="sOv" type="number" min="0" max="30" step="1" style="width:70px">
+<select id="sDir"><option value="AUTO">Hướng: Tự động</option><option value="X">Hướng: Trục X</option><option value="Y">Hướng: Trục Y</option></select></div>
 <div class="row"><button id="bSave">Lưu</button><span id="sMsg"></span></div>
 <hr style="border-color:#333">
 <div class="row"><button class="warn" id="bUno">Nạp Arduino Uno (Nhả D0/D1): TẮT</button></div>
@@ -248,7 +247,7 @@ function hold(el,c){
 }
 hold($('bF'),'F');hold($('bB'),'B');hold($('bL'),'L');hold($('bR'),'R');
 
-let trail=[],lanes=[],planEdge=210,planAxis='Y',planPerim=1;
+let trail=[],lanes=[],planEdge=210,planAxis='Y',lastPlanFetch=0;
 function drawRadar(a){
   const c=$('radar'),g=c.getContext('2d'),w=c.width,h=c.height;
   g.fillStyle='#000';g.fillRect(0,0,w,h);
@@ -264,6 +263,13 @@ function drawRadar(a){
   g.fillStyle='#f55';g.beginPath();g.arc(w/2,h/2,4,0,7);g.fill();
   g.strokeStyle='#f55';g.beginPath();g.moveTo(w/2,h/2);g.lineTo(w/2,h/2-16);g.stroke();
 }
+function laneColor(st){
+  if(st==='COMPLETED')return '#2b8a3e';
+  if(st==='RUNNING')return '#f59f00';
+  if(st==='PARTIAL')return '#e8590c';
+  if(st==='BLOCKED'||st==='FAILED')return '#e03131';
+  return '#335';
+}
 function drawMap(s){
   const c=$('map'),g=c.getContext('2d'),w=c.width,h=c.height;
   g.fillStyle='#000';g.fillRect(0,0,w,h);
@@ -271,17 +277,15 @@ function drawMap(s){
   const m=10,sc=Math.min((w-2*m)/s.W,(h-2*m)/s.L);
   const X=x=>m+x*sc,Y=y=>h-m-y*sc;
   g.strokeStyle='#4af';g.strokeRect(X(0),Y(s.L),s.W*sc,s.L*sc);
-  if(planPerim){
-    g.strokeStyle='#536';
-    g.strokeRect(X(planEdge),Y(s.L-planEdge),(s.W-2*planEdge)*sc,(s.L-2*planEdge)*sc);
-  }
-  g.strokeStyle='#335';
-  lanes.forEach(v=>{
+  lanes.forEach(ln=>{
+    g.strokeStyle=laneColor(ln.status);
+    g.lineWidth=(ln.status==='RUNNING')?2:1;
     g.beginPath();
-    if(planAxis==='X'){g.moveTo(X(planEdge),Y(v));g.lineTo(X(s.W-planEdge),Y(v))}
-    else{g.moveTo(X(v),Y(planEdge));g.lineTo(X(v),Y(s.L-planEdge))}
+    g.moveTo(X(ln.start_x),Y(ln.start_y));
+    g.lineTo(X(ln.end_x),Y(ln.end_y));
     g.stroke();
   });
+  g.lineWidth=1;
   if(s.state==='RUN'||s.state==='IDLE'||s.state==='DONE'){
     trail.push([s.x,s.y]);if(trail.length>800)trail.shift();
   }
@@ -296,22 +300,28 @@ function drawMap(s){
 async function poll(){
   try{
     const s=await (await fetch('/api/status')).json();
-    $('st').textContent='Trạng thái: '+s.state+(s.uno?' [NHẢ D0/D1 NẠP UNO]':'')+
+    $('st').textContent='Trạng thái: '+s.state+' ('+s.cleaning_result+')'+(s.uno?' [NHẢ D0/D1 NẠP UNO]':'')+
       '\nVị trí: x='+s.x+' y='+s.y+' mm, góc='+s.psi+'° | PWM: '+s.oL+'/'+s.oR+
-      '\nPhòng: '+s.W+' x '+s.L+' mm | Bước: '+s.step+'/'+s.total+
+      '\nPhòng: '+s.W+' x '+s.L+' mm | Hướng: '+s.cleaning_direction+' ('+s.start_corner+')'+
+      '\nLàn: '+s.completed_lanes+'/'+s.total_lanes+' xong, '+s.blocked_lanes+' cản, '+s.partial_lanes+' phần ('+s.completed_percent+'%)'+
       '\nSiêu âm Trước/Trái/Phải: '+s.us0+'/'+s.us1+'/'+s.us2+' mm'+(s.err?'\nLỗi: '+s.err:'');
     mopOn=s.mop>0;$('bMop').textContent='Chổi: '+(mopOn?'BẬT':'TẮT');
     unoMode=!!s.uno;$('bUno').textContent='Nạp Arduino Uno (Nhả D0/D1): '+(unoMode?'BẬT':'TẮT');
-    $('bar').style.width=(s.total?Math.round(100*s.step/s.total):0)+'%';
-    if(s.state==='RUN'&&!lanes.length){const p=await (await fetch('/api/plan')).json();lanes=p.lanes;planEdge=p.edge;planAxis=p.axis||'Y';planPerim=p.perim||0}
+    $('bar').style.width=Math.round(s.processed_percent||0)+'%';
+    const now=Date.now();
+    if((s.state==='RUN'||s.state==='DONE')&&(now-lastPlanFetch>1500||!lanes.length)){
+      lastPlanFetch=now;
+      const p=await (await fetch('/api/plan')).json();
+      lanes=p.lanes||[];planEdge=p.edge_mm||210;planAxis=p.direction||'Y';
+    }
     drawMap(s);
     const a=await (await fetch('/api/scan')).json();
     drawRadar(a);
   }catch(e){$('st').textContent='Mất kết nối với robot...'}
   finally{setTimeout(poll,500)}
 }
-async function loadSet(){try{const s=await (await fetch('/api/settings')).json();$('sMop').value=s.mop;$('sCr').value=s.cruise;$('sEd').value=s.edge;$('sPer').checked=!!s.perim}catch(e){}}
-$('bSave').onclick=async()=>{const r=await fetch('/api/settings?mop='+$('sMop').value+'&cruise='+$('sCr').value+'&edge='+$('sEd').value+'&perim='+($('sPer').checked?1:0));$('sMsg').textContent=r.ok?' Đã lưu':' Không lưu được (robot đang chạy)';loadSet()};
+async function loadSet(){try{const s=await (await fetch('/api/settings')).json();$('sMop').value=s.mop;$('sCr').value=s.cruise;$('sEd').value=s.edge;$('sOv').value=s.overlap;$('sDir').value=s.direction}catch(e){}}
+$('bSave').onclick=async()=>{const r=await fetch('/api/settings?mop='+$('sMop').value+'&cruise='+$('sCr').value+'&edge='+$('sEd').value+'&overlap='+$('sOv').value+'&direction='+$('sDir').value);$('sMsg').textContent=r.ok?' Đã lưu':(r.status===400?' Giá trị không hợp lệ':' Không lưu được (robot đang chạy)');loadSet()};
 loadSet();
 poll();
 </script></body></html>
@@ -539,10 +549,13 @@ void correctPose() {
 }
 
 // ======================= HIỆU CHỈNH BAN ĐẦU & LẬP ĐƯỜNG =======================
-void buildPlan();
+bool buildPlan();
 
 void setError(const char* m) {
   errMsg = m;
+  if (state == ST_RUN || state == ST_CALIB) {
+    laneTracker.onSessionFailed(m);
+  }
   state = ST_ERR;
   mopPwm = 0;
   emergencyStopMotors();
@@ -574,71 +587,42 @@ void doCalibrate() {
   px_mm = left;
   py_mm = back;
   haveRoom = true;
-  if (roomW < 2 * cfgEdge + 200 || roomL < 2 * cfgEdge + 200) { setError("Phong qua nho"); return; }
-  buildPlan();
+
+  if (!buildPlan()) return;
   stepIdx = 0; stepStarted = false; stepRetries = 0;
   mopPwm = MOP_PWM;
   state = ST_RUN;
-  Serial.printf("Phong: %.0f x %.0f mm, %d buoc\n", roomW, roomL, (int)steps.size());
+  Serial.printf("Phong: %.0f x %.0f mm | Huong %s | Goc %s | %u lan | %u buoc\n",
+                roomW, roomL, directionToStr(activePlan.chosenDirection),
+                cornerToStr(activePlan.startCorner), activePlan.laneCount, activePlan.stepCount);
 }
 
-void buildPlan() {
-  steps.clear();
-  planLanes.clear();
+bool buildPlan() {
+  PlanRequest req;
+  req.roomW                   = roomW;
+  req.roomL                   = roomL;
+  req.edgeMm                  = (float)cfgEdge;
+  req.mopWidthMm              = cfgMopWidth;
+  req.overlapPercent          = cfgOverlap;
+  req.robotRadiusMm           = (float)ROBOT_RADIUS_MM;
+  req.robotX                  = px_mm;
+  req.robotY                  = py_mm;
+  req.robotPsiDeg             = psi;
+  req.requestedDirection      = cfgDirection;
+  // Tái sử dụng thông số động học ước lượng có sẵn của firmware (không phải vận tốc đo thực tế)
+  req.nominalLinearSpeedMmS   = ((float)cfgCruise / 255.0f) * V_MAX_MM_S;
+  req.nominalAngularSpeedDegS = ((float)(MIN_TURN_PWM + MAX_TURN_PWM) * 0.5f / 255.0f) * SPIN_MAX_DEG_S;
+  req.laneChangePenaltySec    = PLANNER_DEF_LANE_PENALTY_S;
 
-  // 1. Tự động chọn trục làn song song cạnh dài hơn để tối thiểu số lần quay 90°
-  planAxisY = (roomL >= roomW);
-  StepType longType  = planAxisY ? GO_Y : GO_X;
-  StepType crossType = planAxisY ? GO_X : GO_Y;
-
-  float longMin  = (float)cfgEdge;
-  float longMax  = (planAxisY ? roomL : roomW) - (float)cfgEdge;
-  float crossMin = (float)cfgEdge;
-  float crossMax = (planAxisY ? roomW : roomL) - (float)cfgEdge;
-  float longPos  = planAxisY ? py_mm : px_mm;
-  float crossPos = planAxisY ? px_mm : py_mm;
-
-  // 2. Chia làn đều với độ chồng lấn tối thiểu 15% (bù sai số trượt bánh)
-  float span = crossMax - crossMin;
-  float effWidth = clampf(cfgMopWidth * (1.0f - LANE_OVERLAP_RATIO), 60.0f, 400.0f);
-  int N = (int)ceilf(span / effWidth) + 1;
-  if (N < 2) N = 2;
-  float spacing = span / (N - 1);
-
-  // 3. Xuất phát từ góc gần robot nhất (Nearest-Corner Start)
-  bool startAtCrossMin = (crossPos <= 0.5f * (crossMin + crossMax));
-  bool startAtLongMin  = (longPos  <= 0.5f * (longMin  + longMax));
-
-  float crossStart = startAtCrossMin ? crossMin : crossMax;
-  float crossEnd   = startAtCrossMin ? crossMax : crossMin;
-  float longStart  = startAtLongMin  ? longMin  : longMax;
-  float longOther  = startAtLongMin  ? longMax  : longMin;
-
-  // Homing ngắn nhất về góc xuất phát (bước nào < 30 mm sẽ tự bỏ qua trong runNav)
-  steps.push_back({crossType, crossStart, ROLE_HOME});
-  steps.push_back({longType,  longStart,  ROLE_HOME});
-
-  // 4. Sinh N làn Boustrophedon
-  float curLongEnd = longStart;
-  for (int i = 0; i < N; i++) {
-    float ci = startAtCrossMin ? (crossMin + i * spacing) : (crossMax - i * spacing);
-    planLanes.push_back(ci);
-    if (i > 0) steps.push_back({crossType, ci, ROLE_SHIFT});
-    curLongEnd = (i % 2 == 0) ? longOther : longStart;
-    steps.push_back({longType, curLongEnd, ROLE_LANE});
+  PlanError err = CoveragePlanner::generateBestPlan(req, activePlan);
+  if (err != PLAN_OK) {
+    laneTracker.onSessionFailed(planErrorToStr(err));
+    setError(planErrorToStr(err));
+    return false;
   }
 
-  // 5. Vòng lau viền 2 cạnh đầu/cuối làn (robot đang đứng sẵn ở góc (crossEnd, curLongEnd))
-  if (cfgPerim) {
-    float oppLong = (curLongEnd == longMax) ? longMin : longMax;
-    steps.push_back({crossType, crossStart, ROLE_PERIM});
-    steps.push_back({longType,  oppLong,    ROLE_PERIM});
-    steps.push_back({crossType, crossEnd,   ROLE_PERIM});
-  }
-
-  Serial.printf("Ke hoach: truc %c, %d lan, buoc %.0f mm (chong lan %.0f mm), %d buoc%s\n",
-                planAxisY ? 'Y' : 'X', N, spacing, cfgMopWidth - spacing,
-                (int)steps.size(), cfgPerim ? " + vien" : "");
+  laneTracker.beginSession(&activePlan);
+  return true;
 }
 
 // ======================= CẢM BIẾN SIÊU ÂM NON-BLOCKING =======================
@@ -738,17 +722,31 @@ void expectedSideClearance(float heading, float &leftGap, float &rightGap) {
 void finishCleaning() {
   mopPwm = 0;
   emergencyStopMotors();
+  laneTracker.onSessionFinished();
   state = ST_DONE;
-  Serial.println("Hoan thanh!");
+  Serial.printf("Ket thuc phien: %s\n", cleaningResultToStr(laneTracker.getResult()));
 }
 
 void runNav(bool sensorTick) {
-  if (stepIdx >= (int)steps.size()) { finishCleaning(); return; }
-  Step &s = steps[stepIdx];
+  if (!activePlan.valid || stepIdx >= (int)activePlan.stepCount) {
+    finishCleaning();
+    return;
+  }
+  const Step &s = activePlan.steps[stepIdx];
 
   if (!stepStarted) {
+    if (s.purpose == CLEAN_LANE) {
+      laneTracker.onLaneStarted(s.laneId);
+    }
     float cur = (s.type == GO_X) ? px_mm : py_mm;
-    if (fabsf(s.val - cur) < 30.0f) { stepIdx++; stepRetries = 0; return; }
+    if (fabsf(s.val - cur) < 30.0f) {
+      if (s.purpose == CLEAN_LANE) {
+        laneTracker.onLaneCompleted(s.laneId);
+      }
+      stepIdx++;
+      stepRetries = 0;
+      return;
+    }
     if (s.type == GO_X) tgtHeading = (s.val > px_mm) ? 90.0f : 270.0f;
     else                tgtHeading = (s.val > py_mm) ? 0.0f  : 180.0f;
     stepStarted = true;
@@ -757,14 +755,14 @@ void runNav(bool sensorTick) {
     blockCount = 0;
   }
 
-  // Pha lùi ngắn khi chuyển làn GO_X bị vướng mép vật cản
+  // Pha lùi ngắn sẵn có khi chuyển làn bị vướng mép vật cản
   if (phase == PH_BACKOFF) {
     if (millis() < backoffUntilMs) {
       drive(-SLOW_PWM, -SLOW_PWM);
       return;
     }
     emergencyStopMotors();
-    stepStarted = false;  // Thử định hướng và chạy lại bước GO_X
+    stepStarted = false;  // Thử định hướng và chạy lại bước CHANGE_LANE
     return;
   }
 
@@ -773,10 +771,17 @@ void runNav(bool sensorTick) {
   if (phase == PH_TURN) {
     if (fabsf(err) < TURN_TOL_DEG) { phase = PH_DRIVE; stopMotors(); blockCount = 0; return; }
     if (millis() - stepStartMs > 15000) {
+      emergencyStopMotors();
       stepStarted = false;
       stepRetries = 0;
-      stepIdx++;
-      emergencyStopMotors();
+      if (s.purpose == CLEAN_LANE) {
+        laneTracker.onLaneFailed(s.laneId, px_mm, py_mm, "Timeout xoay");
+        stepIdx++;
+      } else {
+        // Không chuyển làn / tiếp cận thành công -> dừng phiên để tránh chạy sai làn
+        laneTracker.onChangeLaneFailed("Timeout xoay chuyen lan");
+        setError("Timeout xoay chuyen lan");
+      }
       return;
     }
     int t = (int)fabsf(err * KT);
@@ -786,6 +791,10 @@ void runNav(bool sensorTick) {
   }
 
   // PH_DRIVE
+  if (s.purpose == CLEAN_LANE) {
+    laneTracker.updateLaneCovered(s.laneId, px_mm, py_mm);
+  }
+
   float pos = (s.type == GO_X) ? px_mm : py_mm;
   bool positive = (tgtHeading == 0.0f || tgtHeading == 90.0f);
   bool reached = positive ? (pos >= s.val) : (pos <= s.val);
@@ -798,6 +807,9 @@ void runNav(bool sensorTick) {
   bool blocked = (blockCount >= BLOCK_CONFIRM_CNT);
 
   if (reached) {
+    if (s.purpose == CLEAN_LANE) {
+      laneTracker.onLaneCompleted(s.laneId);
+    }
     stopMotors();
     stepIdx++;
     stepStarted = false;
@@ -809,32 +821,34 @@ void runNav(bool sensorTick) {
     emergencyStopMotors();
     blockCount = 0;
 
-    // 1. Nếu đang chuyển làn (ROLE_SHIFT) và chưa retry -> lùi nhẹ 450 ms rồi thử lại 1 lần
-    if (s.role == ROLE_SHIFT && stepRetries == 0) {
-      stepRetries = 1;
-      phase = PH_BACKOFF;
-      backoffUntilMs = millis() + 450;
-      Serial.println("Vat can khi chuyen lan -> lui nhe thu lai");
+    // Bước chuyển làn (CHANGE_LANE): dùng cơ chế retry sẵn có 1 lần;
+    // nếu vẫn thất bại -> dừng phiên an toàn thay vì lau sai vị trí làn.
+    if (s.purpose == CHANGE_LANE) {
+      if (stepRetries == 0) {
+        stepRetries = 1;
+        phase = PH_BACKOFF;
+        backoffUntilMs = millis() + 450;
+        Serial.println("Vat can khi chuyen lan -> lui nhe thu lai");
+        return;
+      }
+      laneTracker.onChangeLaneFailed("Vat can khi chuyen lan");
+      setError("Khong chuyen duoc sang lan ke tiep");
       return;
     }
 
-    // 2. Chống bỏ sót kép: nếu bị chặn sớm trên làn chính (còn > RECOVER_MIN_REM_MM)
-    //    và ngay sau là [ROLE_SHIFT -> ROLE_LANE], chèn bước ROLE_RECOVER sau ROLE_SHIFT
-    //    để làn kế tiếp tiến lên phủ kín vùng phía sau vật cản trước khi quay ngược.
-    float remOnBlock = fabsf(s.val - pos);
-    if (s.role == ROLE_LANE && remOnBlock > RECOVER_MIN_REM_MM &&
-        (int)steps.size() < MAX_PLAN_STEPS && stepIdx + 2 < (int)steps.size() &&
-        steps[stepIdx + 1].role == ROLE_SHIFT && steps[stepIdx + 2].role == ROLE_LANE) {
-      Step rec = { s.type, s.val, ROLE_RECOVER };
-      steps.insert(steps.begin() + stepIdx + 2, rec);
-      Serial.println("Vat can giua lan -> chen buoc boc phu nua lan ke tiep");
-    } else {
-      Serial.println("Gap vat can -> ket thuc buoc");
+    if (s.purpose == APPROACH_START) {
+      laneTracker.onSessionFailed("Vat can khi tiep can diem bat dau");
+      setError("Khong tiep can duoc diem bat dau");
+      return;
     }
 
+    // Bước lau làn (CLEAN_LANE): Skip and Record (ghi nhận BLOCKED hoặc PARTIAL)
+    laneTracker.onLaneBlocked(s.laneId, px_mm, py_mm, "Gap vat can");
     stepIdx++;
     stepStarted = false;
     stepRetries = 0;
+    Serial.printf("Lan %d bi can -> %s\n", (int)s.laneId,
+                  laneStatusToStr(activePlan.lanes[s.laneId].status));
     return;
   }
 
@@ -857,20 +871,23 @@ void runNav(bool sensorTick) {
 // ======================= LỆNH ĐIỀU KHIỂN =======================
 void startCleaning() {
   if (unoFlashMode) return;
-  steps.clear();
-  planLanes.clear();
+  memset(&activePlan, 0, sizeof(activePlan));
+  laneTracker.reset();
   calibOk = calibFail = 0;
   calibSin = calibCos = 0;
   for (int k = 0; k < 4; k++) calibD[k] = 0;
   haveRoom = false; errMsg = "";
   manualUntil = 0; mopPwm = 0;
-  stepRetries = 0; blockCount = 0;
+  stepIdx = 0; stepStarted = false; stepRetries = 0; blockCount = 0;
   emergencyStopMotors();
   state = ST_CALIB;
   Serial.println("Bat dau hieu chinh...");
 }
 
 void stopAll() {
+  if (state == ST_RUN || state == ST_CALIB) {
+    laneTracker.onUserAborted();
+  }
   mopPwm = 0;
   manualUntil = 0;
   state = ST_IDLE;
@@ -887,15 +904,29 @@ void handleStatus() {
   const char* names[] = {"IDLE", "CALIB", "RUN", "DONE", "ERR"};
   String safeErr = errMsg;
   safeErr.replace("\"", "'");
-  char b[360];
+  CleaningProgress pr = laneTracker.getProgress();
+  const char* dirStr = activePlan.valid ? directionToStr(activePlan.chosenDirection)
+                                        : directionToStr(cfgDirection);
+  const char* corStr = activePlan.valid ? cornerToStr(activePlan.startCorner) : "NONE";
+
+  char b[680];
   snprintf(b, sizeof(b),
            "{\"state\":\"%s\",\"x\":%d,\"y\":%d,\"psi\":%d,\"W\":%d,\"L\":%d,"
            "\"step\":%d,\"total\":%d,\"us0\":%d,\"us1\":%d,\"us2\":%d,"
-           "\"mop\":%d,\"oL\":%d,\"oR\":%d,\"uno\":%d,\"err\":\"%s\"}",
+           "\"mop\":%d,\"oL\":%d,\"oR\":%d,\"uno\":%d,\"err\":\"%s\","
+           "\"cleaning_result\":\"%s\",\"cleaning_direction\":\"%s\",\"start_corner\":\"%s\","
+           "\"total_lanes\":%u,\"current_lane_id\":%d,\"completed_lanes\":%u,"
+           "\"blocked_lanes\":%u,\"partial_lanes\":%u,\"failed_lanes\":%u,\"pending_lanes\":%u,"
+           "\"processed_percent\":%.2f,\"completed_percent\":%.2f,\"estimated_distance_percent\":%.2f}",
            names[state], (int)px_mm, (int)py_mm, (int)psi,
            haveRoom ? (int)roomW : 0, haveRoom ? (int)roomL : 0,
-           stepIdx, (int)steps.size(), us[0], us[1], us[2],
-           mopPwm, outL, outR, unoFlashMode ? 1 : 0, safeErr.c_str());
+           stepIdx, (int)activePlan.stepCount, us[0], us[1], us[2],
+           mopPwm, outL, outR, unoFlashMode ? 1 : 0, safeErr.c_str(),
+           cleaningResultToStr(laneTracker.getResult()), dirStr, corStr,
+           (unsigned)pr.totalLanes, (int)pr.currentLaneId, (unsigned)pr.completedLanes,
+           (unsigned)pr.blockedLanes, (unsigned)pr.partialLanes, (unsigned)pr.failedLanes,
+           (unsigned)pr.pendingLanes,
+           pr.processedPercent, pr.completedPercent, pr.estimatedDistancePercent);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", b);
 }
@@ -984,54 +1015,163 @@ void pollLink() {
 }
 
 // ---- Cài đặt lưu trong Flash ----
+bool parseStrictFloat(const String& str, float& out) {
+  if (str.length() == 0) return false;
+  char* endp = nullptr;
+  float v = strtof(str.c_str(), &endp);
+  if (endp == str.c_str() || *endp != '\0' || !isfinite(v)) return false;
+  out = v;
+  return true;
+}
+
+bool parseStrictInt(const String& str, int& out) {
+  if (str.length() == 0) return false;
+  char* endp = nullptr;
+  long v = strtol(str.c_str(), &endp, 10);
+  if (endp == str.c_str() || *endp != '\0') return false;
+  if (v < -32768L || v > 32767L) return false;
+  out = (int)v;
+  return true;
+}
+
+bool parseDirectionArg(const String& str, CleaningDirection& out) {
+  if (str == "AUTO" || str == "auto" || str == "0") { out = DIRECTION_AUTO; return true; }
+  if (str == "X"    || str == "x"    || str == "1") { out = DIRECTION_X;    return true; }
+  if (str == "Y"    || str == "y"    || str == "2") { out = DIRECTION_Y;    return true; }
+  return false;
+}
+
 void loadSettings() {
   prefs.begin("robot", true);
   cfgMopWidth = clampf(prefs.getFloat("mop", DEF_MOP_WIDTH_MM), 100.0f, 400.0f);
   cfgCruise   = clampi(prefs.getInt("cruise", DEF_CRUISE_PWM), 100, MAX_SAFE_PWM);
   cfgEdge     = clampi(prefs.getInt("edge", DEF_EDGE_MM), ROBOT_RADIUS_MM + 10, 500);
-  cfgPerim    = prefs.getBool("perim", true);
+  cfgOverlap  = clampf(prefs.getFloat("overlap", DEF_OVERLAP_PCT), MIN_OVERLAP_PERCENT, MAX_OVERLAP_PERCENT);
+  int dirInt  = prefs.getInt("dir", (int)DIRECTION_AUTO);
+  if (dirInt >= (int)DIRECTION_AUTO && dirInt <= (int)DIRECTION_Y) {
+    cfgDirection = (CleaningDirection)dirInt;
+  } else {
+    cfgDirection = DIRECTION_AUTO;
+  }
   prefs.end();
 }
 
 void handleSettings() {
-  bool changed = server.hasArg("mop") || server.hasArg("cruise") ||
-                 server.hasArg("edge") || server.hasArg("perim");
-  if (changed) {
+  bool hasAny = server.hasArg("mop") || server.hasArg("cruise") ||
+                server.hasArg("edge") || server.hasArg("overlap") ||
+                server.hasArg("direction");
+  if (hasAny) {
     if (state == ST_RUN || state == ST_CALIB) {
       server.send(409, "text/plain", "busy");
       return;
     }
-    if (server.hasArg("mop"))
-      cfgMopWidth = clampf(server.arg("mop").toFloat(), 100.0f, 400.0f);
-    if (server.hasArg("cruise"))
-      cfgCruise   = clampi(server.arg("cruise").toInt(), 100, MAX_SAFE_PWM);
-    if (server.hasArg("edge"))
-      cfgEdge     = clampi(server.arg("edge").toInt(), ROBOT_RADIUS_MM + 10, 500);
-    if (server.hasArg("perim"))
-      cfgPerim    = (server.arg("perim").toInt() != 0);
+
+    float newMop = cfgMopWidth;
+    int   newCruise = cfgCruise;
+    int   newEdge = cfgEdge;
+    float newOverlap = cfgOverlap;
+    CleaningDirection newDir = cfgDirection;
+
+    if (server.hasArg("mop")) {
+      if (!parseStrictFloat(server.arg("mop"), newMop) || newMop < 100.0f || newMop > 400.0f) {
+        server.send(400, "text/plain", "invalid mop (100..400)");
+        return;
+      }
+    }
+    if (server.hasArg("cruise")) {
+      if (!parseStrictInt(server.arg("cruise"), newCruise) || newCruise < 100 || newCruise > MAX_SAFE_PWM) {
+        server.send(400, "text/plain", "invalid cruise");
+        return;
+      }
+    }
+    if (server.hasArg("edge")) {
+      if (!parseStrictInt(server.arg("edge"), newEdge) || newEdge < ROBOT_RADIUS_MM + 10 || newEdge > 500) {
+        server.send(400, "text/plain", "invalid edge");
+        return;
+      }
+    }
+    if (server.hasArg("overlap")) {
+      if (!parseStrictFloat(server.arg("overlap"), newOverlap) ||
+          newOverlap < MIN_OVERLAP_PERCENT || newOverlap > MAX_OVERLAP_PERCENT) {
+        server.send(400, "text/plain", "invalid overlap (0..30)");
+        return;
+      }
+    }
+    if (server.hasArg("direction")) {
+      if (!parseDirectionArg(server.arg("direction"), newDir)) {
+        server.send(400, "text/plain", "invalid direction (AUTO|X|Y)");
+        return;
+      }
+    }
+
+    cfgMopWidth  = newMop;
+    cfgCruise    = newCruise;
+    cfgEdge      = newEdge;
+    cfgOverlap   = newOverlap;
+    cfgDirection = newDir;
 
     prefs.begin("robot", false);
     prefs.putFloat("mop", cfgMopWidth);
     prefs.putInt("cruise", cfgCruise);
     prefs.putInt("edge", cfgEdge);
-    prefs.putBool("perim", cfgPerim);
+    prefs.putFloat("overlap", cfgOverlap);
+    prefs.putInt("dir", (int)cfgDirection);
     prefs.end();
   }
-  char b[112];
-  snprintf(b, sizeof(b), "{\"mop\":%d,\"cruise\":%d,\"edge\":%d,\"perim\":%d}",
-           (int)cfgMopWidth, cfgCruise, cfgEdge, cfgPerim ? 1 : 0);
+
+  char b[160];
+  snprintf(b, sizeof(b),
+           "{\"mop\":%d,\"cruise\":%d,\"edge\":%d,\"overlap\":%.1f,\"direction\":\"%s\"}",
+           (int)cfgMopWidth, cfgCruise, cfgEdge, cfgOverlap, directionToStr(cfgDirection));
   server.send(200, "application/json", b);
 }
 
 void handlePlan() {
-  String j = "{\"axis\":\"";
-  j += planAxisY ? 'Y' : 'X';
-  j += "\",\"lanes\":[";
-  for (size_t i = 0; i < planLanes.size(); i++) {
-    if (i) j += ',';
-    j += (int)planLanes[i];
+  String j;
+  j.reserve(640 + activePlan.laneCount * 96);
+
+  char hdr[640];
+  snprintf(hdr, sizeof(hdr),
+           "{\"planner_version\":\"2.0\",\"valid\":%s,\"direction\":\"%s\",\"axis\":\"%s\","
+           "\"start_corner\":\"%s\",\"room_width_mm\":%.0f,\"room_length_mm\":%.0f,"
+           "\"mop_width_mm\":%.0f,\"edge_mm\":%.0f,\"edge\":%.0f,\"overlap_percent\":%.1f,"
+           "\"lane_spacing_mm\":%.2f,\"lane_count\":%u,"
+           "\"metrics\":{\"cleaning_distance_mm\":%.1f,\"transition_distance_mm\":%.1f,"
+           "\"approach_distance_mm\":%.1f,\"total_distance_mm\":%.1f,"
+           "\"turn_count\":%u,\"total_turn_degrees\":%.1f,\"estimated_cost\":%.2f},\"lanes\":[",
+           activePlan.valid ? "true" : "false",
+           activePlan.valid ? directionToStr(activePlan.chosenDirection) : directionToStr(cfgDirection),
+           activePlan.valid ? directionToStr(activePlan.chosenDirection) : directionToStr(cfgDirection),
+           activePlan.valid ? cornerToStr(activePlan.startCorner) : "NONE",
+           activePlan.valid ? activePlan.roomW : 0.0f,
+           activePlan.valid ? activePlan.roomL : 0.0f,
+           activePlan.valid ? activePlan.mopWidthMm : cfgMopWidth,
+           activePlan.valid ? activePlan.edgeMm : (float)cfgEdge,
+           activePlan.valid ? activePlan.edgeMm : (float)cfgEdge,
+           activePlan.valid ? activePlan.overlapPercent : cfgOverlap,
+           activePlan.valid ? activePlan.actualSpacingMm : 0.0f,
+           activePlan.valid ? (unsigned)activePlan.laneCount : 0u,
+           activePlan.metrics.cleaningDistanceMm,
+           activePlan.metrics.transitionDistanceMm,
+           activePlan.metrics.approachDistanceMm,
+           activePlan.metrics.totalDistanceMm,
+           (unsigned)activePlan.metrics.turnCount,
+           activePlan.metrics.totalTurnDegrees,
+           activePlan.metrics.estimatedCost);
+  j += hdr;
+
+  if (activePlan.valid) {
+    char item[128];
+    for (uint16_t i = 0; i < activePlan.laneCount; i++) {
+      const CleaningLane& ln = activePlan.lanes[i];
+      if (i > 0) j += ',';
+      snprintf(item, sizeof(item),
+               "{\"id\":%u,\"start_x\":%.0f,\"start_y\":%.0f,\"end_x\":%.0f,\"end_y\":%.0f,\"status\":\"%s\"}",
+               (unsigned)ln.id, ln.startX, ln.startY, ln.endX, ln.endY, laneStatusToStr(ln.status));
+      j += item;
+    }
   }
-  j += "],\"edge\":" + String(cfgEdge) + ",\"perim\":" + String(cfgPerim ? 1 : 0) + "}";
+  j += "]}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
 }
@@ -1085,7 +1225,7 @@ void sendLink() {
     lastTelMs = now;
     const char* nm[] = {"IDLE", "CAL", "RUN", "DONE", "ERR"};
     Serial1.printf("T,%s %d,%d %da %d/%d\n",
-                   nm[state], (int)px_mm, (int)py_mm, (int)psi, stepIdx, (int)steps.size());
+                   nm[state], (int)px_mm, (int)py_mm, (int)psi, stepIdx, (int)activePlan.stepCount);
   }
 }
 
