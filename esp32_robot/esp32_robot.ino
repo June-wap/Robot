@@ -34,12 +34,7 @@
  */
 
 #include <Arduino.h>
-#include <WiFi.h>
 #include <WebServer.h>
-#include <ESPmDNS.h>
-#include <ArduinoOTA.h>
-#include <math.h>
-#include <stdlib.h>
 #include "src/planning/LaneTypes.h"
 #include "src/planning/CoveragePlanner.h"
 #include "src/planning/LaneTracker.h"
@@ -60,6 +55,9 @@
 #include "src/control/CommandHandler.h"
 #include "src/navigation/CleaningSession.h"
 #include "src/navigation/Navigator.h"
+#include "src/communication/ArduinoLink.h"
+#include "src/communication/WiFiManager.h"
+#include "src/communication/OtaManager.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -96,40 +94,6 @@ static int& cfgCruise = gRobot.cfgCruise;
 static int& cfgEdge = gRobot.cfgEdge;
 static float& cfgOverlap = gRobot.cfgOverlap;
 static CleaningDirection& cfgDirection = gRobot.cfgDirection;
-static String& myIP = gRobot.myIP;
-
-// Liên kết UART
-int lastSentMop = -1;
-unsigned long lastSendMs = 0, lastMopMs = 0, lastTelMs = 0;
-
-// ======================= CHẾ ĐỘ NHẢ CHÂN NẠP UNO =======================
-void arduinoLinkSendImmediateStop() {
-  if (!unoFlashMode) {
-    Serial1.print("M,0,0\n");
-    lastSendMs = millis();
-  }
-}
-void setUnoFlashMode(bool en) {
-  if (en == unoFlashMode) return;
-  if (en) {
-    cmdL = cmdR = outL = outR = 0;
-    mopPwm = 0;
-    manualUntil = 0;
-    Serial1.print("M,0,0\nW,0\n");
-    Serial1.flush();
-    delay(20);
-    Serial1.end();
-    pinMode(LINK_TX_PIN, INPUT);
-    pinMode(LINK_RX_PIN, INPUT);
-    unoFlashMode = true;
-    Serial.println("UNO FLASH MODE: ON (GPIO18/19 = High-Z)");
-  } else {
-    Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
-    unoFlashMode = false;
-    lastSentMop = -1;
-    Serial.println("UNO FLASH MODE: OFF (UART1 resumed)");
-  }
-}
 
 // ======================= WEB SERVER =======================
 void handleRoot() {
@@ -205,34 +169,6 @@ void handleUnoMode() {
     setUnoFlashMode(en);
   }
   server.send(200, "text/plain", unoFlashMode ? "1" : "0");
-}
-
-// Lệnh từ HC-05 (Arduino chuyển tiếp dạng "C,<ký tự>\n")
-void pollLink() {
-  if (unoFlashMode) return;
-  static char line[24];
-  static int n = 0;
-  while (Serial1.available()) {
-    char c = (char)Serial1.read();
-    if (c == '\n') {
-      line[n] = 0;
-      if (n >= 3 && line[0] == 'C' && line[1] == ',') {
-        char k = line[2];
-        if      (k == 'A') applyCmd("start", cfgCruise);
-        else if (k == 'X') applyCmd("stop", cfgCruise);
-        else if (k == 'F') applyCmd("F", cfgCruise);
-        else if (k == 'B') applyCmd("B", cfgCruise);
-        else if (k == 'L') applyCmd("L", cfgCruise);
-        else if (k == 'R') applyCmd("R", cfgCruise);
-        else if (k == 'S') applyCmd("S", cfgCruise);
-        else if (k == 'W') applyCmd("mopon", cfgCruise);
-        else if (k == 'w') applyCmd("mopoff", cfgCruise);
-      }
-      n = 0;
-    } else if (c != '\r' && n < (int)sizeof(line) - 1) {
-      line[n++] = c;
-    }
-  }
 }
 
 // ---- Cài đặt lưu trong Flash (đã tách sang Settings) ----
@@ -350,65 +286,12 @@ void handlePlan() {
   server.send(200, "application/json", j);
 }
 
-void startWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Dang ket noi WiFi");
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 15000) {
-    delay(250); Serial.print('.');
-  }
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    myIP = WiFi.localIP().toString();
-    Serial.println("Da ket noi WiFi nha.");
-  } else {
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASS);
-    myIP = WiFi.softAPIP().toString();
-    Serial.printf("Khong vao duoc WiFi nha -> phat WiFi rieng '%s' (mat khau %s)\n", AP_SSID, AP_PASS);
-  }
-  Serial.println("==============================================");
-  Serial.println("Mo trinh duyet:  http://" + myIP);
-  Serial.println("hoac:            http://robot.local");
-  Serial.println("==============================================");
-  if (MDNS.begin("robot")) MDNS.addService("http", "tcp", 80);
-}
-
-void sendLink() {
-  if (unoFlashMode) return;
-  unsigned long now = millis();
-
-  // Cập nhật PWM thực tế qua bộ ramp mềm và gửi ở 20 Hz (50 ms)
-  if (now - lastSendMs >= 50) {
-    lastSendMs = now;
-    outL = rampAxis(outL, cmdL);
-    outR = rampAxis(outR, cmdR);
-    Serial1.printf("M,%d,%d\n", outL, outR);
-  }
-
-  // Gửi lệnh chổi ngay khi thay đổi trạng thái hoặc mỗi 300 ms
-  if (mopPwm != lastSentMop || now - lastMopMs >= 300) {
-    lastMopMs = now;
-    lastSentMop = mopPwm;
-    Serial1.printf("W,%d\n", mopPwm);
-  }
-
-  // Telemetry gọn (< 32 byte, gửi mỗi 2s lệch pha với gói M để tránh nghẽn SoftwareSerial của Uno)
-  if (now - lastTelMs >= 2000 && now - lastSendMs >= 20) {
-    lastTelMs = now;
-    const char* nm[] = {"IDLE", "CAL", "RUN", "DONE", "ERR"};
-    Serial1.printf("T,%s %d,%d %da %d/%d\n",
-                   nm[state], (int)px_mm, (int)py_mm, (int)psi, stepIdx, (int)activePlan.stepCount);
-  }
-}
-
 // ======================= SETUP / LOOP =======================
 void setup() {
   Serial.begin(115200);
   loadSettings();
 
-  Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
+  arduinoLinkInit();
   lidarBeginSerial();
   ultrasonicInit();
   lidarInit();
@@ -424,19 +307,7 @@ void setup() {
   server.on("/api/unomode", handleUnoMode);
   server.begin();
 
-  // Nạp code qua WiFi (Arduino IDE -> Tools -> Port -> robot)
-  ArduinoOTA.setHostname("robot");
-  ArduinoOTA.setPassword("robot1234");
-  ArduinoOTA.setMdnsEnabled(false);
-  ArduinoOTA.onStart([]() {
-    cmdL = cmdR = outL = outR = 0;
-    mopPwm = 0;
-    if (!unoFlashMode) {
-      Serial1.print("M,0,0\nW,0\n");
-      Serial1.flush();
-    }
-  });
-  ArduinoOTA.begin();
+  otaInit();
 
   poseInitTimer();
   lastScanMs = millis();
@@ -444,7 +315,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  ArduinoOTA.handle();
+  otaHandle();
   pollLink();
   pollLidar();
   pollUltrasonic();

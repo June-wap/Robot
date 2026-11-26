@@ -1,10 +1,9 @@
 #include "MotionController.h"
+#include "../communication/ArduinoLink.h"
 #include "../config/RobotConfig.h"
 #include "../core/MathUtils.h"
 #include "../core/RobotContext.h"
 #include <stdlib.h>
-
-extern void arduinoLinkSendImmediateStop();
 
 void drive(int l, int r) {
   gRobot.cmdL = clampi(l, -MAX_SAFE_PWM, MAX_SAFE_PWM);
