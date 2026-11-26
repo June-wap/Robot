@@ -44,65 +44,11 @@
 #include "LaneTypes.h"
 #include "CoveragePlanner.h"
 #include "LaneTracker.h"
-
-// Khai báo kiểu dữ liệu trước mọi hàm để Arduino IDE sinh prototype chính xác
-struct Wall { bool ok; float dist; float phi; };
-enum State { ST_IDLE, ST_CALIB, ST_RUN, ST_DONE, ST_ERR };
-enum Phase { PH_TURN, PH_DRIVE, PH_BACKOFF };
-
-// ======================= WIFI =======================
-#define WIFI_SSID  "Ngoc Tram_2G"
-#define WIFI_PASS  "trungkien"
-#define AP_SSID    "RobotLauNha"
-#define AP_PASS    "88888888"
-
-// ======================= CẤU HÌNH PHẦN CỨNG =======================
-#define LIDAR_RX_PIN   16
-#define LINK_TX_PIN    19
-#define LINK_RX_PIN    18
-const int US_TRIG[3] = {25, 27, 32};   // 0 trước, 1 trái, 2 phải
-const int US_ECHO[3] = {26, 14, 33};
-
-#define LIDAR_BAUD         230400
-#define LINK_BAUD          38400
-#define LIDAR_OFFSET_DEG   0
-#define LIDAR_CLOCKWISE    true
-#define LIDAR_MIN_MM       100
-#define LIDAR_MAX_MM       8000
-#define LIDAR_MIN_INTENS   10
-
-// ======================= THÔNG SỐ ROBOT & BẢO VỆ L293D =======================
-#define ROBOT_RADIUS_MM    170
-#define DEF_EDGE_MM        (ROBOT_RADIUS_MM + 40)
-#define DEF_MOP_WIDTH_MM   180.0f
-#define V_MAX_MM_S         300.0f
-#define SPIN_MAX_DEG_S     150.0f
-
-// Giới hạn trần PWM & bước tăng tốc mềm (mỗi 50 ms) để giảm dòng đỉnh bảo vệ L293D
-#define MAX_SAFE_PWM       210
-#define DEF_CRUISE_PWM     165
-#define SLOW_PWM           110
-#define MIN_TURN_PWM       120
-#define MAX_TURN_PWM       175
-#define MOP_PWM            200
-#define PWM_RAMP_STEP      30    // Tăng/giảm tối đa 30 PWM / 50 ms (~0.3s từ 0 -> 170)
-#define PWM_STOP_STEP      90    // Giảm tốc nhanh hơn khi về 0
-
-#define KT                 3.0f
-#define KH                 2.5f
-#define TURN_TOL_DEG       3.0f
-#define K_YAW              0.8f
-#define K_POS              0.5f
-#define POS_JUMP_MAX_MM    300.0f
-
-#define US_BLOCK_MM        55
-#define LIDAR_BLOCK_MM     (ROBOT_RADIUS_MM + 25)
-#define SIDE_NEAR_MM       60
-#define WALL_HALF_DEG      25
-#define US_TIMEOUT_MS      14    // ~2.4 m, không block CPU
-#define US_PERIOD_MS       30
-#define BLOCK_CONFIRM_CNT  3     // 3 chu kỳ dữ liệu cảm biến thực liên tiếp
-#define DEF_OVERLAP_PCT    10.0f // Chế độ STANDARD = 10% (phạm vi 0..30%)
+#include "src/config/HardwareConfig.h"
+#include "src/config/RobotConfig.h"
+#include "src/config/NetworkConfig.h"
+#include "src/core/RobotTypes.h"
+#include "src/core/MathUtils.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
 WebServer server(80);
@@ -327,18 +273,7 @@ poll();
 </script></body></html>
 )rawliteral";
 
-// ======================= TIỆN ÍCH =======================
-float wrap180(float a) { while (a > 180.0f) a -= 360.0f; while (a <= -180.0f) a += 360.0f; return a; }
-float wrap90(float a)  { a = fmodf(a, 90.0f); if (a > 45.0f) a -= 90.0f; if (a < -45.0f) a += 90.0f; return a; }
-int   clampi(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
-
-uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
-  if (a > b) { uint16_t t = a; a = b; b = t; }
-  if (b > c) { uint16_t t = b; b = c; c = t; }
-  if (a > b) { uint16_t t = a; a = b; b = t; }
-  return b;
-}
+// ======================= ĐIỀU KHIỂN ĐỘNG CƠ =======================
 
 void drive(int l, int r) {
   cmdL = clampi(l, -MAX_SAFE_PWM, MAX_SAFE_PWM);
