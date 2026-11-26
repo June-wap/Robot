@@ -53,6 +53,9 @@
 #include "src/sensors/Lidar.h"
 #include "src/sensors/Ultrasonic.h"
 #include "src/sensors/ObstacleDetector.h"
+#include "src/localization/WallDetection.h"
+#include "src/localization/PoseEstimator.h"
+#include "src/localization/Calibration.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -98,17 +101,17 @@ unsigned long stepStartMs = 0;
 unsigned long backoffUntilMs = 0;
 uint8_t stepRetries = 0;
 
-unsigned long lastPoseMs = 0;
-
 // Điều khiển động cơ & liên kết UART
 int lastSentMop = -1;
 unsigned long lastSendMs = 0, lastMopMs = 0, lastTelMs = 0;
 int blockCount = 0;
 
-// Hiệu chỉnh phòng
-int calibOk = 0, calibFail = 0;
-float calibD[4] = {0, 0, 0, 0};
-float calibSin = 0, calibCos = 0;
+void resetNavigationState() {
+  stepIdx = 0;
+  stepStarted = false;
+  stepRetries = 0;
+  blockCount = 0;
+}
 
 // ======================= ĐIỀU KHIỂN ĐỘNG CƠ =======================
 
@@ -167,103 +170,7 @@ void setUnoFlashMode(bool en) {
   }
 }
 
-// ======================= KHỚP TƯỜNG (PCA / TLS) =======================
-Wall fitWall(int center) {
-  Wall w = {false, 0, 0};
-  float X[64], Y[64];
-  int n = 0;
-  for (int a = -WALL_HALF_DEG; a <= WALL_HALF_DEG && n < 64; a++) {
-    uint16_t d = scan[((center + a) % 360 + 360) % 360];
-    if (!d) continue;
-    float r = radians((float)(center + a));
-    X[n] = d * sinf(r);
-    Y[n] = d * cosf(r);
-    n++;
-  }
-  if (n < 10) return w;
-  float mx = 0, my = 0;
-  for (int i = 0; i < n; i++) { mx += X[i]; my += Y[i]; }
-  mx /= n; my /= n;
-  float sxx = 0, syy = 0, sxy = 0;
-  for (int i = 0; i < n; i++) {
-    float dx = X[i] - mx, dy = Y[i] - my;
-    sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
-  }
-  float phi = 0.5f * atan2f(2.0f * sxy, sxx - syy);
-  float nx = -sinf(phi), ny = cosf(phi);
-  float res = 0;
-  for (int i = 0; i < n; i++) {
-    float e = (X[i] - mx) * nx + (Y[i] - my) * ny;
-    res += e * e;
-  }
-  float rms = sqrtf(res / n);
-  if (rms > 25.0f) return w;
-  w.ok = true;
-  w.dist = fabsf(mx * nx + my * ny);
-  w.phi = degrees(phi);
-  return w;
-}
-
-// ======================= ĐỊNH VỊ =======================
-void predictPose() {
-  unsigned long now = millis();
-  float dt = (now - lastPoseMs) / 1000.0f;
-  lastPoseMs = now;
-  if (dt <= 0 || dt > 0.5f) return;
-  // Dùng outL/outR (PWM thực tế sau ramp) để ước lượng động học sát hơn
-  float v = (outL + outR) / 510.0f * V_MAX_MM_S;
-  float w = (outL - outR) / 510.0f * SPIN_MAX_DEG_S;
-  float mid = psi + 0.5f * w * dt;
-  px_mm += v * dt * sinf(radians(mid));
-  py_mm += v * dt * cosf(radians(mid));
-  psi = wrap180(psi + w * dt);
-}
-
-void correctPose() {
-  const int al[4] = {0, 90, 180, 270};
-  Wall w[4];
-  float sx = 0, sy = 0;
-  int n = 0;
-  for (int k = 0; k < 4; k++) {
-    w[k] = fitWall(al[k]);
-    if (w[k].ok) {
-      float e = wrap90(w[k].phi - 90.0f);
-      sx += sinf(radians(4.0f * e));
-      sy += cosf(radians(4.0f * e));
-      n++;
-    }
-  }
-  if (n == 0) return;
-  float eps = degrees(atan2f(sx, sy)) / 4.0f;
-  float meas = psi + wrap90(eps - psi);
-  psi = wrap180(psi + K_YAW * (meas - psi));
-
-  if (!haveRoom) return;
-  float psq = roundf(psi / 90.0f) * 90.0f;
-  if (fabsf(psi - psq) > 12.0f) return;
-
-  float xs = 0, ys = 0;
-  int nx = 0, ny = 0;
-  for (int k = 0; k < 4; k++) {
-    if (!w[k].ok) continue;
-    int q = ((al[k] + (int)psq) % 360 + 360) % 360;
-    float d = w[k].dist;
-    if      (q == 0)   { ys += roomL - d; ny++; }
-    else if (q == 90)  { xs += roomW - d; nx++; }
-    else if (q == 180) { ys += d;         ny++; }
-    else               { xs += d;         nx++; }
-  }
-  if (nx) {
-    float mxv = xs / nx;
-    if (fabsf(mxv - px_mm) < POS_JUMP_MAX_MM) px_mm += K_POS * (mxv - px_mm);
-  }
-  if (ny) {
-    float myv = ys / ny;
-    if (fabsf(myv - py_mm) < POS_JUMP_MAX_MM) py_mm += K_POS * (myv - py_mm);
-  }
-}
-
-// ======================= HIỆU CHỈNH BAN ĐẦU & LẬP ĐƯỜNG =======================
+// ======================= LẬP ĐƯỜNG & LỖI PHIÊN =======================
 bool buildPlan();
 
 void setError(const char* m) {
@@ -274,42 +181,6 @@ void setError(const char* m) {
   state = ST_ERR;
   mopPwm = 0;
   emergencyStopMotors();
-}
-
-void doCalibrate() {
-  const int al[4] = {0, 90, 180, 270};
-  Wall w[4];
-  bool all = true;
-  for (int k = 0; k < 4; k++) { w[k] = fitWall(al[k]); if (!w[k].ok) all = false; }
-  if (!all) {
-    if (++calibFail > 60) setError("Khong thay du 4 buc tuong");
-    return;
-  }
-  float sx = 0, sy = 0;
-  for (int k = 0; k < 4; k++) {
-    float e = wrap90(w[k].phi - 90.0f);
-    sx += sinf(radians(4.0f * e)); sy += cosf(radians(4.0f * e));
-    calibD[k] += w[k].dist;
-  }
-  calibSin += sx; calibCos += sy;
-  if (++calibOk < 5) return;
-
-  float eps = degrees(atan2f(calibSin, calibCos)) / 4.0f;
-  float front = calibD[0] / 5.0f, right = calibD[1] / 5.0f, back = calibD[2] / 5.0f, left = calibD[3] / 5.0f;
-  psi = eps;
-  roomW = left + right;
-  roomL = front + back;
-  px_mm = left;
-  py_mm = back;
-  haveRoom = true;
-
-  if (!buildPlan()) return;
-  stepIdx = 0; stepStarted = false; stepRetries = 0;
-  mopPwm = MOP_PWM;
-  state = ST_RUN;
-  Serial.printf("Phong: %.0f x %.0f mm | Huong %s | Goc %s | %u lan | %u buoc\n",
-                roomW, roomL, directionToStr(activePlan.chosenDirection),
-                cornerToStr(activePlan.startCorner), activePlan.laneCount, activePlan.stepCount);
 }
 
 bool buildPlan() {
@@ -495,12 +366,10 @@ void startCleaning() {
   if (unoFlashMode) return;
   memset(&activePlan, 0, sizeof(activePlan));
   laneTracker.reset();
-  calibOk = calibFail = 0;
-  calibSin = calibCos = 0;
-  for (int k = 0; k < 4; k++) calibD[k] = 0;
+  resetCalibration();
   haveRoom = false; errMsg = "";
   manualUntil = 0; mopPwm = 0;
-  stepIdx = 0; stepStarted = false; stepRetries = 0; blockCount = 0;
+  resetNavigationState();
   emergencyStopMotors();
   state = ST_CALIB;
   Serial.println("Bat dau hieu chinh...");
@@ -839,7 +708,7 @@ void setup() {
   });
   ArduinoOTA.begin();
 
-  lastPoseMs = millis();
+  poseInitTimer();
   lastScanMs = millis();
 }
 
