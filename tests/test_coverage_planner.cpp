@@ -254,7 +254,7 @@ static void runGroupC_Overlap() {
     PlanRequest r = makeBaseReq(420, 3000, 210, 1500, 0, 20.0f);
     EXPECT_TRUE(CoveragePlanner::generateBestPlan(r, p) == PLAN_OK &&
                 p.laneCount == 1 && p.actualSpacingMm == 0.0f &&
-                isfinite(p.metrics.estimatedCost),
+                std::isfinite(p.metrics.estimatedCost),
                 "C06: Single-lane room avoids division by zero");
   }
 }
