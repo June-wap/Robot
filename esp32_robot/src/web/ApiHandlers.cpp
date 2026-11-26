@@ -27,25 +27,29 @@ void handleStatus() {
                                                : directionToStr(gRobot.cfgDirection);
   const char* corStr = gRobot.activePlan.valid ? cornerToStr(gRobot.activePlan.startCorner) : "NONE";
 
-  char b[680];
-  snprintf(b, sizeof(b),
-           "{\"state\":\"%s\",\"x\":%d,\"y\":%d,\"psi\":%d,\"W\":%d,\"L\":%d,"
-           "\"step\":%d,\"total\":%d,\"us0\":%d,\"us1\":%d,\"us2\":%d,"
-           "\"mop\":%d,\"oL\":%d,\"oR\":%d,\"uno\":%d,\"err\":\"%s\","
-           "\"cleaning_result\":\"%s\",\"cleaning_direction\":\"%s\",\"start_corner\":\"%s\","
-           "\"total_lanes\":%u,\"current_lane_id\":%d,\"completed_lanes\":%u,"
-           "\"blocked_lanes\":%u,\"partial_lanes\":%u,\"failed_lanes\":%u,\"pending_lanes\":%u,"
-           "\"processed_percent\":%.2f,\"completed_percent\":%.2f,\"estimated_distance_percent\":%.2f}",
-           names[gRobot.state], (int)gRobot.px_mm, (int)gRobot.py_mm, (int)gRobot.psi,
-           gRobot.haveRoom ? (int)gRobot.roomW : 0, gRobot.haveRoom ? (int)gRobot.roomL : 0,
-           gRobot.stepIdx, (int)gRobot.activePlan.stepCount, gRobot.us[0], gRobot.us[1], gRobot.us[2],
-           gRobot.mopPwm, gRobot.outL, gRobot.outR, gRobot.unoFlashMode ? 1 : 0, safeErr.c_str(),
-           cleaningResultToStr(gRobot.laneTracker.getResult()), dirStr, corStr,
-           (unsigned)pr.totalLanes, (int)pr.currentLaneId, (unsigned)pr.completedLanes,
-           (unsigned)pr.blockedLanes, (unsigned)pr.partialLanes, (unsigned)pr.failedLanes,
-           (unsigned)pr.pendingLanes,
-           pr.processedPercent, pr.completedPercent, pr.estimatedDistancePercent);
+  char b[768];
+  int n = snprintf(b, sizeof(b),
+                   "{\"state\":\"%s\",\"x\":%d,\"y\":%d,\"psi\":%d,\"W\":%d,\"L\":%d,"
+                   "\"step\":%d,\"total\":%d,\"us0\":%d,\"us1\":%d,\"us2\":%d,"
+                   "\"mop\":%d,\"oL\":%d,\"oR\":%d,\"uno\":%d,\"err\":\"%s\","
+                   "\"cleaning_result\":\"%s\",\"cleaning_direction\":\"%s\",\"start_corner\":\"%s\","
+                   "\"total_lanes\":%u,\"current_lane_id\":%d,\"completed_lanes\":%u,"
+                   "\"blocked_lanes\":%u,\"partial_lanes\":%u,\"failed_lanes\":%u,\"pending_lanes\":%u,"
+                   "\"processed_percent\":%.2f,\"completed_percent\":%.2f,\"estimated_distance_percent\":%.2f}",
+                   names[gRobot.state], (int)gRobot.px_mm, (int)gRobot.py_mm, (int)gRobot.psi,
+                   gRobot.haveRoom ? (int)gRobot.roomW : 0, gRobot.haveRoom ? (int)gRobot.roomL : 0,
+                   gRobot.stepIdx, (int)gRobot.activePlan.stepCount, gRobot.us[0], gRobot.us[1], gRobot.us[2],
+                   gRobot.mopPwm, gRobot.outL, gRobot.outR, gRobot.unoFlashMode ? 1 : 0, safeErr.c_str(),
+                   cleaningResultToStr(gRobot.laneTracker.getResult()), dirStr, corStr,
+                   (unsigned)pr.totalLanes, (int)pr.currentLaneId, (unsigned)pr.completedLanes,
+                   (unsigned)pr.blockedLanes, (unsigned)pr.partialLanes, (unsigned)pr.failedLanes,
+                   (unsigned)pr.pendingLanes,
+                   pr.processedPercent, pr.completedPercent, pr.estimatedDistancePercent);
   server.sendHeader("Cache-Control", "no-store");
+  if (n < 0 || n >= (int)sizeof(b)) {
+    server.send(500, "application/json", "{\"error\":\"status_serialization_failed\"}");
+    return;
+  }
   server.send(200, "application/json", b);
 }
 
@@ -151,46 +155,55 @@ void handleSettings() {
   }
 
   char b[160];
-  snprintf(b, sizeof(b),
-           "{\"mop\":%d,\"cruise\":%d,\"edge\":%d,\"overlap\":%.1f,\"direction\":\"%s\"}",
-           (int)gRobot.cfgMopWidth, gRobot.cfgCruise, gRobot.cfgEdge,
-           gRobot.cfgOverlap, directionToStr(gRobot.cfgDirection));
+  int n = snprintf(b, sizeof(b),
+                   "{\"mop\":%d,\"cruise\":%d,\"edge\":%d,\"overlap\":%.1f,\"direction\":\"%s\"}",
+                   (int)gRobot.cfgMopWidth, gRobot.cfgCruise, gRobot.cfgEdge,
+                   gRobot.cfgOverlap, directionToStr(gRobot.cfgDirection));
+  if (n < 0 || n >= (int)sizeof(b)) {
+    server.send(500, "application/json", "{\"error\":\"settings_serialization_failed\"}");
+    return;
+  }
   server.send(200, "application/json", b);
 }
 
 void handlePlan() {
   WebServer& server = getWebServer();
   String j;
-  j.reserve(640 + gRobot.activePlan.laneCount * 96);
+  j.reserve(640 + (size_t)gRobot.activePlan.laneCount * 104u + 8u);
 
   char hdr[640];
-  snprintf(hdr, sizeof(hdr),
-           "{\"planner_version\":\"2.0\",\"valid\":%s,\"direction\":\"%s\",\"axis\":\"%s\","
-           "\"start_corner\":\"%s\",\"room_width_mm\":%.0f,\"room_length_mm\":%.0f,"
-           "\"mop_width_mm\":%.0f,\"edge_mm\":%.0f,\"edge\":%.0f,\"overlap_percent\":%.1f,"
-           "\"lane_spacing_mm\":%.2f,\"lane_count\":%u,"
-           "\"metrics\":{\"cleaning_distance_mm\":%.1f,\"transition_distance_mm\":%.1f,"
-           "\"approach_distance_mm\":%.1f,\"total_distance_mm\":%.1f,"
-           "\"turn_count\":%u,\"total_turn_degrees\":%.1f,\"estimated_cost\":%.2f},\"lanes\":[",
-           gRobot.activePlan.valid ? "true" : "false",
-           gRobot.activePlan.valid ? directionToStr(gRobot.activePlan.chosenDirection) : directionToStr(gRobot.cfgDirection),
-           gRobot.activePlan.valid ? directionToStr(gRobot.activePlan.chosenDirection) : directionToStr(gRobot.cfgDirection),
-           gRobot.activePlan.valid ? cornerToStr(gRobot.activePlan.startCorner) : "NONE",
-           gRobot.activePlan.valid ? gRobot.activePlan.roomW : 0.0f,
-           gRobot.activePlan.valid ? gRobot.activePlan.roomL : 0.0f,
-           gRobot.activePlan.valid ? gRobot.activePlan.mopWidthMm : gRobot.cfgMopWidth,
-           gRobot.activePlan.valid ? gRobot.activePlan.edgeMm : (float)gRobot.cfgEdge,
-           gRobot.activePlan.valid ? gRobot.activePlan.edgeMm : (float)gRobot.cfgEdge,
-           gRobot.activePlan.valid ? gRobot.activePlan.overlapPercent : gRobot.cfgOverlap,
-           gRobot.activePlan.valid ? gRobot.activePlan.actualSpacingMm : 0.0f,
-           gRobot.activePlan.valid ? (unsigned)gRobot.activePlan.laneCount : 0u,
-           gRobot.activePlan.metrics.cleaningDistanceMm,
-           gRobot.activePlan.metrics.transitionDistanceMm,
-           gRobot.activePlan.metrics.approachDistanceMm,
-           gRobot.activePlan.metrics.totalDistanceMm,
-           (unsigned)gRobot.activePlan.metrics.turnCount,
-           gRobot.activePlan.metrics.totalTurnDegrees,
-           gRobot.activePlan.metrics.estimatedCost);
+  int hdrLen = snprintf(hdr, sizeof(hdr),
+                        "{\"planner_version\":\"2.0\",\"valid\":%s,\"direction\":\"%s\",\"axis\":\"%s\","
+                        "\"start_corner\":\"%s\",\"room_width_mm\":%.0f,\"room_length_mm\":%.0f,"
+                        "\"mop_width_mm\":%.0f,\"edge_mm\":%.0f,\"edge\":%.0f,\"overlap_percent\":%.1f,"
+                        "\"lane_spacing_mm\":%.2f,\"lane_count\":%u,"
+                        "\"metrics\":{\"cleaning_distance_mm\":%.1f,\"transition_distance_mm\":%.1f,"
+                        "\"approach_distance_mm\":%.1f,\"total_distance_mm\":%.1f,"
+                        "\"turn_count\":%u,\"total_turn_degrees\":%.1f,\"estimated_cost\":%.2f},\"lanes\":[",
+                        gRobot.activePlan.valid ? "true" : "false",
+                        gRobot.activePlan.valid ? directionToStr(gRobot.activePlan.chosenDirection) : directionToStr(gRobot.cfgDirection),
+                        gRobot.activePlan.valid ? directionToStr(gRobot.activePlan.chosenDirection) : directionToStr(gRobot.cfgDirection),
+                        gRobot.activePlan.valid ? cornerToStr(gRobot.activePlan.startCorner) : "NONE",
+                        gRobot.activePlan.valid ? gRobot.activePlan.roomW : 0.0f,
+                        gRobot.activePlan.valid ? gRobot.activePlan.roomL : 0.0f,
+                        gRobot.activePlan.valid ? gRobot.activePlan.mopWidthMm : gRobot.cfgMopWidth,
+                        gRobot.activePlan.valid ? gRobot.activePlan.edgeMm : (float)gRobot.cfgEdge,
+                        gRobot.activePlan.valid ? gRobot.activePlan.edgeMm : (float)gRobot.cfgEdge,
+                        gRobot.activePlan.valid ? gRobot.activePlan.overlapPercent : gRobot.cfgOverlap,
+                        gRobot.activePlan.valid ? gRobot.activePlan.actualSpacingMm : 0.0f,
+                        gRobot.activePlan.valid ? (unsigned)gRobot.activePlan.laneCount : 0u,
+                        gRobot.activePlan.metrics.cleaningDistanceMm,
+                        gRobot.activePlan.metrics.transitionDistanceMm,
+                        gRobot.activePlan.metrics.approachDistanceMm,
+                        gRobot.activePlan.metrics.totalDistanceMm,
+                        (unsigned)gRobot.activePlan.metrics.turnCount,
+                        gRobot.activePlan.metrics.totalTurnDegrees,
+                        gRobot.activePlan.metrics.estimatedCost);
+  if (hdrLen < 0 || hdrLen >= (int)sizeof(hdr)) {
+    server.sendHeader("Cache-Control", "no-store");
+    server.send(500, "application/json", "{\"error\":\"plan_header_serialization_failed\"}");
+    return;
+  }
   j += hdr;
 
   if (gRobot.activePlan.valid) {
@@ -198,9 +211,14 @@ void handlePlan() {
     for (uint16_t i = 0; i < gRobot.activePlan.laneCount; i++) {
       const CleaningLane& ln = gRobot.activePlan.lanes[i];
       if (i > 0) j += ',';
-      snprintf(item, sizeof(item),
-               "{\"id\":%u,\"start_x\":%.0f,\"start_y\":%.0f,\"end_x\":%.0f,\"end_y\":%.0f,\"status\":\"%s\"}",
-               (unsigned)ln.id, ln.startX, ln.startY, ln.endX, ln.endY, laneStatusToStr(ln.status));
+      int itemLen = snprintf(item, sizeof(item),
+                             "{\"id\":%u,\"start_x\":%.0f,\"start_y\":%.0f,\"end_x\":%.0f,\"end_y\":%.0f,\"status\":\"%s\"}",
+                             (unsigned)ln.id, ln.startX, ln.startY, ln.endX, ln.endY, laneStatusToStr(ln.status));
+      if (itemLen < 0 || itemLen >= (int)sizeof(item)) {
+        server.sendHeader("Cache-Control", "no-store");
+        server.send(500, "application/json", "{\"error\":\"plan_lane_serialization_failed\"}");
+        return;
+      }
       j += item;
     }
   }
