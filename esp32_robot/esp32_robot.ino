@@ -56,6 +56,8 @@
 #include "src/localization/WallDetection.h"
 #include "src/localization/PoseEstimator.h"
 #include "src/localization/Calibration.h"
+#include "src/control/MotionController.h"
+#include "src/control/CommandHandler.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -113,41 +115,13 @@ void resetNavigationState() {
   blockCount = 0;
 }
 
-// ======================= ĐIỀU KHIỂN ĐỘNG CƠ =======================
-
-void drive(int l, int r) {
-  cmdL = clampi(l, -MAX_SAFE_PWM, MAX_SAFE_PWM);
-  cmdR = clampi(r, -MAX_SAFE_PWM, MAX_SAFE_PWM);
-}
-
-void stopMotors() { cmdL = cmdR = 0; }
-
-// Dừng khẩn cấp: đưa output về 0 ngay lập tức (dùng khi va chạm, stopAll, OTA)
-void emergencyStopMotors() {
-  cmdL = cmdR = 0;
-  outL = outR = 0;
+// ======================= CHẾ ĐỘ NHẢ CHÂN NẠP UNO =======================
+void arduinoLinkSendImmediateStop() {
   if (!unoFlashMode) {
     Serial1.print("M,0,0\n");
     lastSendMs = millis();
   }
 }
-
-// Tăng/giảm tốc mềm & dead-time đảo chiều 50 ms để giảm dòng đỉnh trên L293D
-int rampAxis(int cur, int tgt) {
-  if (tgt == 0) {
-    if (abs(cur) <= PWM_STOP_STEP) return 0;
-    return cur + (cur > 0 ? -PWM_STOP_STEP : PWM_STOP_STEP);
-  }
-  if ((cur > 0 && tgt < 0) || (cur < 0 && tgt > 0)) {
-    return 0;  // Ép qua 0 tối thiểu 1 chu kỳ (50 ms) trước khi đảo chiều
-  }
-  int diff = tgt - cur;
-  if (diff > PWM_RAMP_STEP)  return cur + PWM_RAMP_STEP;
-  if (diff < -PWM_RAMP_STEP) return cur - PWM_RAMP_STEP;
-  return tgt;
-}
-
-// ======================= CHẾ ĐỘ NHẢ CHÂN NẠP UNO =======================
 void setUnoFlashMode(bool en) {
   if (en == unoFlashMode) return;
   if (en) {
@@ -441,22 +415,6 @@ void handleScanBin() {
   server.setContentLength(sizeof(scan));
   server.send(200, "application/octet-stream", "");
   server.client().write((const uint8_t*)scan, sizeof(scan));
-}
-
-void applyCmd(const String& c, int v) {
-  if (unoFlashMode) return;
-  v = clampi(v, 80, MAX_SAFE_PWM);
-  if (c == "start")       startCleaning();
-  else if (c == "stop")   stopAll();
-  else if (c == "mopon")  { if (state != ST_RUN) mopPwm = MOP_PWM; }
-  else if (c == "mopoff") { if (state != ST_RUN) mopPwm = 0; }
-  else if (c == "S")      { manualUntil = 0; stopMotors(); }
-  else if (state != ST_RUN && state != ST_CALIB) {
-    if      (c == "F") { manualL =  v; manualR =  v; manualUntil = millis() + 400; }
-    else if (c == "B") { manualL = -v; manualR = -v; manualUntil = millis() + 400; }
-    else if (c == "L") { manualL = -v; manualR =  v; manualUntil = millis() + 400; }
-    else if (c == "R") { manualL =  v; manualR = -v; manualUntil = millis() + 400; }
-  }
 }
 
 void handleCmd() {
