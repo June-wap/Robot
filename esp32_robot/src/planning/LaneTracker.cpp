@@ -1,6 +1,6 @@
 #include "LaneTracker.h"
-#include <math.h>
-#include <string.h>
+#include <cmath>
+#include <cstring>
 
 static inline float clampPct(float v) {
   if (v < 0.0f)   return 0.0f;
@@ -12,7 +12,9 @@ LaneTracker::LaneTracker()
     : plan_(nullptr),
       result_(RESULT_NONE),
       currentLaneId_(-1),
-      totalPlannedCleanMm_(0.0f) {
+      totalPlannedCleanMm_(0.0f),
+      currentLaneOffTrack_(false),
+      currentLaneMaxCrossTrackMm_(0.0f) {
   lastReason_[0] = '\0';
 }
 
@@ -21,7 +23,14 @@ void LaneTracker::reset() {
   result_ = RESULT_NONE;
   currentLaneId_ = -1;
   totalPlannedCleanMm_ = 0.0f;
+  currentLaneOffTrack_ = false;
+  currentLaneMaxCrossTrackMm_ = 0.0f;
   lastReason_[0] = '\0';
+}
+
+void LaneTracker::onCalibrationStarted() {
+  reset();
+  result_ = RESULT_RUNNING;
 }
 
 void LaneTracker::setReason(const char* reason) {
@@ -29,13 +38,77 @@ void LaneTracker::setReason(const char* reason) {
     lastReason_[0] = '\0';
     return;
   }
-  strncpy(lastReason_, reason, sizeof(lastReason_) - 1);
+  std::strncpy(lastReason_, reason, sizeof(lastReason_) - 1);
   lastReason_[sizeof(lastReason_) - 1] = '\0';
 }
 
 bool LaneTracker::isValidLaneId(int16_t laneId) const {
   return (plan_ != nullptr && plan_->valid &&
           laneId >= 0 && laneId < (int16_t)plan_->laneCount);
+}
+
+float LaneTracker::computeAlongProgress(const CleaningLane& ln, float curX, float curY) const {
+  const float dx = ln.endX - ln.startX;
+  const float dy = ln.endY - ln.startY;
+  if (fabsf(dy) >= fabsf(dx)) {
+    return (dy >= 0.0f) ? (curY - ln.startY) : (ln.startY - curY);
+  }
+  return (dx >= 0.0f) ? (curX - ln.startX) : (ln.startX - curX);
+}
+
+float LaneTracker::computeCrossTrackError(int16_t laneId, float curX, float curY) const {
+  if (!isValidLaneId(laneId) || !std::isfinite(curX) || !std::isfinite(curY)) {
+    return 1e9f;
+  }
+  const CleaningLane& ln = plan_->lanes[laneId];
+  const float dx = ln.endX - ln.startX;
+  const float dy = ln.endY - ln.startY;
+  if (fabsf(dy) >= fabsf(dx)) {
+    return fabsf(curX - ln.startX);
+  }
+  return fabsf(curY - ln.startY);
+}
+
+bool LaneTracker::isWithinCrossTrack(int16_t laneId, float curX, float curY) const {
+  return computeCrossTrackError(laneId, curX, curY) <= LANE_CROSS_TRACK_MAX_MM;
+}
+
+bool LaneTracker::isPositionAtLaneStart(int16_t laneId, float curX, float curY) const {
+  if (!isValidLaneId(laneId) || !std::isfinite(curX) || !std::isfinite(curY)) {
+    return false;
+  }
+  const CleaningLane& ln = plan_->lanes[laneId];
+  const float dx = ln.endX - ln.startX;
+  const float dy = ln.endY - ln.startY;
+  float alongErr = 0.0f;
+  float crossErr = 0.0f;
+  if (fabsf(dy) >= fabsf(dx)) {
+    alongErr = fabsf(curY - ln.startY);
+    crossErr = fabsf(curX - ln.startX);
+  } else {
+    alongErr = fabsf(curX - ln.startX);
+    crossErr = fabsf(curY - ln.startY);
+  }
+  return (alongErr <= LANE_START_ALONG_TOL_MM) && (crossErr <= LANE_CROSS_TRACK_MAX_MM);
+}
+
+bool LaneTracker::isPositionAtLaneEnd(int16_t laneId, float curX, float curY) const {
+  if (!isValidLaneId(laneId) || !std::isfinite(curX) || !std::isfinite(curY)) {
+    return false;
+  }
+  const CleaningLane& ln = plan_->lanes[laneId];
+  const float dx = ln.endX - ln.startX;
+  const float dy = ln.endY - ln.startY;
+  float alongErr = 0.0f;
+  float crossErr = 0.0f;
+  if (fabsf(dy) >= fabsf(dx)) {
+    alongErr = fabsf(curY - ln.endY);
+    crossErr = fabsf(curX - ln.endX);
+  } else {
+    alongErr = fabsf(curX - ln.endX);
+    crossErr = fabsf(curY - ln.endY);
+  }
+  return (alongErr <= LANE_END_ALONG_TOL_MM) && (crossErr <= LANE_CROSS_TRACK_MAX_MM);
 }
 
 void LaneTracker::beginSession(CoveragePlan* plan) {
@@ -54,6 +127,8 @@ void LaneTracker::beginSession(CoveragePlan* plan) {
     totalPlannedCleanMm_ += plan_->lanes[i].plannedLengthMm;
   }
   currentLaneId_ = -1;
+  currentLaneOffTrack_ = false;
+  currentLaneMaxCrossTrackMm_ = 0.0f;
   result_ = RESULT_RUNNING;
   lastReason_[0] = '\0';
 }
@@ -64,23 +139,27 @@ void LaneTracker::onLaneStarted(int16_t laneId) {
   if (ln.status == LANE_PENDING) {
     ln.status = LANE_RUNNING;
     currentLaneId_ = laneId;
+    currentLaneOffTrack_ = false;
+    currentLaneMaxCrossTrackMm_ = 0.0f;
   }
 }
 
 void LaneTracker::updateLaneCovered(int16_t laneId, float curX, float curY) {
-  if (!isValidLaneId(laneId)) return;
+  if (!isValidLaneId(laneId) || !std::isfinite(curX) || !std::isfinite(curY)) return;
   CleaningLane& ln = plan_->lanes[laneId];
   if (ln.status != LANE_RUNNING) return;
 
-  const float dx = ln.endX - ln.startX;
-  const float dy = ln.endY - ln.startY;
-  float proj = 0.0f;
-  if (fabsf(dy) >= fabsf(dx)) {
-    proj = (dy >= 0.0f) ? (curY - ln.startY) : (ln.startY - curY);
-  } else {
-    proj = (dx >= 0.0f) ? (curX - ln.startX) : (ln.startX - curX);
+  const float crossErr = computeCrossTrackError(laneId, curX, curY);
+  if (crossErr > currentLaneMaxCrossTrackMm_) {
+    currentLaneMaxCrossTrackMm_ = crossErr;
+  }
+  if (crossErr > LANE_CROSS_TRACK_MAX_MM) {
+    // Đang lệch khỏi tâm làn vượt ngưỡng -> không ghi nhận thêm tiến độ lau
+    currentLaneOffTrack_ = true;
+    return;
   }
 
+  float proj = computeAlongProgress(ln, curX, curY);
   if (proj < 0.0f) proj = 0.0f;
   if (proj > ln.plannedLengthMm) proj = ln.plannedLengthMm;
   if (proj > ln.estimatedCoveredLengthMm) {
@@ -91,9 +170,46 @@ void LaneTracker::updateLaneCovered(int16_t laneId, float curX, float curY) {
 void LaneTracker::onLaneCompleted(int16_t laneId) {
   if (!isValidLaneId(laneId)) return;
   CleaningLane& ln = plan_->lanes[laneId];
+  // Chỉ cho phép hoàn thành làn đang ở trạng thái RUNNING (tránh đánh dấu sai làn PENDING/FAILED/BLOCKED)
+  if (ln.status != LANE_RUNNING) return;
   ln.status = LANE_COMPLETED;
   ln.estimatedCoveredLengthMm = ln.plannedLengthMm;
   if (currentLaneId_ == laneId) currentLaneId_ = -1;
+}
+
+bool LaneTracker::completeLaneWithPose(int16_t laneId, float curX, float curY) {
+  if (!isValidLaneId(laneId)) return false;
+  CleaningLane& ln = plan_->lanes[laneId];
+  if (ln.status != LANE_RUNNING) return false;
+
+  if (!std::isfinite(curX) || !std::isfinite(curY)) {
+    ln.status = LANE_FAILED;
+    if (currentLaneId_ == laneId) currentLaneId_ = -1;
+    setReason("Toa do khong hop le khi ket thuc lan");
+    return false;
+  }
+
+  updateLaneCovered(laneId, curX, curY);
+
+  const float crossErr = computeCrossTrackError(laneId, curX, curY);
+  const float alongProg = computeAlongProgress(ln, curX, curY);
+  const bool offTrack = currentLaneOffTrack_ || (crossErr > LANE_CROSS_TRACK_MAX_MM);
+  const bool reachedEnd = (alongProg >= ln.plannedLengthMm - LANE_END_ALONG_TOL_MM) &&
+                          (ln.estimatedCoveredLengthMm >= ln.plannedLengthMm - LANE_END_ALONG_TOL_MM);
+
+  if (offTrack || !reachedEnd) {
+    const float covered = ln.estimatedCoveredLengthMm;
+    const bool isPartial = (ln.plannedLengthMm > 0.0f) &&
+                           (covered >= LANE_PARTIAL_MIN_MM) &&
+                           (covered >= ln.plannedLengthMm * LANE_PARTIAL_MIN_RATIO);
+    ln.status = isPartial ? LANE_PARTIAL : LANE_FAILED;
+    if (currentLaneId_ == laneId) currentLaneId_ = -1;
+    setReason(offTrack ? "Lech lan vuot nguong cho phep" : "Chua hoan thanh du chieu dai lan");
+    return false;
+  }
+
+  onLaneCompleted(laneId);
+  return true;
 }
 
 void LaneTracker::onLaneBlocked(int16_t laneId, float curX, float curY, const char* reason) {
@@ -142,7 +258,7 @@ void LaneTracker::onUserAborted() {
     }
     currentLaneId_ = -1;
     result_ = RESULT_ABORTED;
-    setReason("Nguoi dung dung");
+    setReason(plan_ ? "Nguoi dung dung" : "Nguoi dung dung trong hieu chinh");
   }
 }
 
@@ -168,14 +284,16 @@ void LaneTracker::onSessionFinished() {
   const CleaningProgress p = getProgress();
   if (p.totalLanes > 0 && p.completedLanes == p.totalLanes) {
     result_ = RESULT_COMPLETED;
-  } else {
+  } else if (p.completedLanes > 0 || p.partialLanes > 0) {
     result_ = RESULT_PARTIAL;
+  } else {
+    result_ = RESULT_FAILED;
   }
 }
 
 CleaningProgress LaneTracker::getProgress() const {
   CleaningProgress p;
-  memset(&p, 0, sizeof(CleaningProgress));
+  std::memset(&p, 0, sizeof(CleaningProgress));
   p.currentLaneId = currentLaneId_;
 
   if (!plan_ || !plan_->valid || plan_->laneCount == 0) {

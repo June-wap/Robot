@@ -51,7 +51,7 @@ bool buildPlan() {
 void startCleaning() {
   if (gRobot.unoFlashMode) return;
   memset(&gRobot.activePlan, 0, sizeof(gRobot.activePlan));
-  gRobot.laneTracker.reset();
+  gRobot.laneTracker.onCalibrationStarted();
   resetCalibration();
   gRobot.haveRoom = false;
   gRobot.errMsg = "";
