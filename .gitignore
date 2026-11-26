@@ -1,0 +1,33 @@
+# Local credentials override (never commit real passwords)
+esp32_robot/src/config/Secrets.h
+
+# Build artifacts & compiled binaries
+*.exe
+*.o
+*.obj
+*.elf
+*.bin
+*.hex
+*.map
+*.pdb
+*.ilk
+*.out
+build/
+dist/
+out/
+
+# Arduino IDE / CLI / PlatformIO caches
+.arduino/
+.pio/
+.vscode/ipch/
+*.tmp
+*.bak
+*.log
+
+# OS / IDE metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+.idea/
