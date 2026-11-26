@@ -51,6 +51,8 @@
 #include "src/core/RobotContext.h"
 #include "src/core/MathUtils.h"
 #include "src/sensors/Lidar.h"
+#include "src/sensors/Ultrasonic.h"
+#include "src/sensors/ObstacleDetector.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -97,19 +99,6 @@ unsigned long backoffUntilMs = 0;
 uint8_t stepRetries = 0;
 
 unsigned long lastPoseMs = 0;
-
-// Siêu âm Non-blocking (ngắt ngoài + lọc trung vị 3 mẫu)
-volatile uint32_t usRiseUs[3]  = {0, 0, 0};
-volatile uint32_t usWidthUs[3] = {0, 0, 0};
-volatile bool     usHigh[3]    = {false, false, false};
-volatile bool     usDone[3]    = {false, false, false};
-
-uint16_t usHist[3][3] = {{9999, 9999, 9999}, {9999, 9999, 9999}, {9999, 9999, 9999}};
-uint8_t  usHistIdx[3] = {0, 0, 0};
-int      usTurn = 0;
-bool     usBusy = false;
-unsigned long lastUsMs = 0;
-unsigned long usTrigMs = 0;
 
 // Điều khiển động cơ & liên kết UART
 int lastSentMop = -1;
@@ -349,99 +338,6 @@ bool buildPlan() {
 
   laneTracker.beginSession(&activePlan);
   return true;
-}
-
-// ======================= CẢM BIẾN SIÊU ÂM NON-BLOCKING =======================
-static inline void IRAM_ATTR handleUsIsr(int idx) {
-  if (digitalRead(US_ECHO[idx]) == HIGH) {
-    usRiseUs[idx] = micros();
-    usHigh[idx] = true;
-  } else if (usHigh[idx]) {
-    usWidthUs[idx] = micros() - usRiseUs[idx];
-    usHigh[idx] = false;
-    usDone[idx] = true;
-  }
-}
-void IRAM_ATTR isrUs0() { handleUsIsr(0); }
-void IRAM_ATTR isrUs1() { handleUsIsr(1); }
-void IRAM_ATTR isrUs2() { handleUsIsr(2); }
-
-void pushUsSample(int idx, uint16_t mm) {
-  uint8_t p = usHistIdx[idx];
-  usHist[idx][p] = mm;
-  usHistIdx[idx] = (p + 1) % 3;
-  us[idx] = median3(usHist[idx][0], usHist[idx][1], usHist[idx][2]);
-  if (idx == 0) newUsFront = true;
-}
-
-void pollUltrasonic() {
-  unsigned long now = millis();
-  if (!usBusy) {
-    if (now - lastUsMs < US_PERIOD_MS) return;
-    lastUsMs = now;
-    noInterrupts();
-    usDone[usTurn] = false;
-    usHigh[usTurn] = false;
-    usWidthUs[usTurn] = 0;
-    interrupts();
-
-    digitalWrite(US_TRIG[usTurn], LOW);
-    delayMicroseconds(2);
-    digitalWrite(US_TRIG[usTurn], HIGH);
-    delayMicroseconds(10);
-    digitalWrite(US_TRIG[usTurn], LOW);
-    usTrigMs = now;
-    usBusy = true;
-    return;
-  }
-
-  if (usDone[usTurn]) {
-    noInterrupts();
-    uint32_t w = usWidthUs[usTurn];
-    usDone[usTurn] = false;
-    interrupts();
-    uint16_t mm = (w >= 115 && w <= 12000) ? (uint16_t)(w * 0.1715f) : 9999;
-    pushUsSample(usTurn, mm);
-    usTurn = (usTurn + 1) % 3;
-    usBusy = false;
-  } else if (now - usTrigMs >= US_TIMEOUT_MS) {
-    noInterrupts();
-    usHigh[usTurn] = false;
-    usDone[usTurn] = false;
-    interrupts();
-    pushUsSample(usTurn, 9999);
-    usTurn = (usTurn + 1) % 3;
-    usBusy = false;
-  }
-}
-
-bool frontBlockedRaw() {
-  if (us[0] < US_BLOCK_MM) return true;
-  uint16_t m = 9999;
-  for (int a = -15; a <= 15; a++) {
-    uint16_t d = scan[(a + 360) % 360];
-    if (d && d < m) m = d;
-  }
-  return m < LIDAR_BLOCK_MM;
-}
-
-// Khoảng hở dự kiến từ mép robot tới tường bên trái / bên phải theo hướng hiện tại
-void expectedSideClearance(float heading, float &leftGap, float &rightGap) {
-  if (!haveRoom) { leftGap = rightGap = 9999.0f; return; }
-  int h = ((int)roundf(heading / 90.0f) * 90 % 360 + 360) % 360;
-  if (h == 0) {           // +Y
-    leftGap  = px_mm - ROBOT_RADIUS_MM;
-    rightGap = (roomW - px_mm) - ROBOT_RADIUS_MM;
-  } else if (h == 180) {  // -Y
-    leftGap  = (roomW - px_mm) - ROBOT_RADIUS_MM;
-    rightGap = px_mm - ROBOT_RADIUS_MM;
-  } else if (h == 90) {   // +X
-    leftGap  = (roomL - py_mm) - ROBOT_RADIUS_MM;
-    rightGap = py_mm - ROBOT_RADIUS_MM;
-  } else {                // 270 (-X)
-    leftGap  = py_mm - ROBOT_RADIUS_MM;
-    rightGap = (roomL - py_mm) - ROBOT_RADIUS_MM;
-  }
 }
 
 // ======================= ĐIỀU HƯỚNG =======================
@@ -915,16 +811,7 @@ void setup() {
 
   Serial1.begin(LINK_BAUD, SERIAL_8N1, LINK_RX_PIN, LINK_TX_PIN);
   lidarBeginSerial();
-
-  for (int i = 0; i < 3; i++) {
-    pinMode(US_TRIG[i], OUTPUT);
-    digitalWrite(US_TRIG[i], LOW);
-    pinMode(US_ECHO[i], INPUT);
-  }
-  attachInterrupt(digitalPinToInterrupt(US_ECHO[0]), isrUs0, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(US_ECHO[1]), isrUs1, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(US_ECHO[2]), isrUs2, CHANGE);
-
+  ultrasonicInit();
   lidarInit();
 
   startWiFi();
