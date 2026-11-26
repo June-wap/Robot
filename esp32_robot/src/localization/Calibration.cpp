@@ -4,12 +4,10 @@
 #include "../core/MathUtils.h"
 #include "../core/RobotContext.h"
 #include "../core/RobotTypes.h"
+#include "../navigation/CleaningSession.h"
+#include "../navigation/Navigator.h"
 #include <Arduino.h>
 #include <math.h>
-
-extern bool buildPlan();
-extern void setError(const char* m);
-extern void resetNavigationState();
 
 static int   calibOk = 0;
 static int   calibFail = 0;

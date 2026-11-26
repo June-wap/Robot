@@ -58,6 +58,8 @@
 #include "src/localization/Calibration.h"
 #include "src/control/MotionController.h"
 #include "src/control/CommandHandler.h"
+#include "src/navigation/CleaningSession.h"
+#include "src/navigation/Navigator.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
@@ -96,24 +98,9 @@ static float& cfgOverlap = gRobot.cfgOverlap;
 static CleaningDirection& cfgDirection = gRobot.cfgDirection;
 static String& myIP = gRobot.myIP;
 
-bool stepStarted = false;
-Phase phase = PH_TURN;
-float tgtHeading = 0;
-unsigned long stepStartMs = 0;
-unsigned long backoffUntilMs = 0;
-uint8_t stepRetries = 0;
-
-// Điều khiển động cơ & liên kết UART
+// Liên kết UART
 int lastSentMop = -1;
 unsigned long lastSendMs = 0, lastMopMs = 0, lastTelMs = 0;
-int blockCount = 0;
-
-void resetNavigationState() {
-  stepIdx = 0;
-  stepStarted = false;
-  stepRetries = 0;
-  blockCount = 0;
-}
 
 // ======================= CHẾ ĐỘ NHẢ CHÂN NẠP UNO =======================
 void arduinoLinkSendImmediateStop() {
@@ -142,221 +129,6 @@ void setUnoFlashMode(bool en) {
     lastSentMop = -1;
     Serial.println("UNO FLASH MODE: OFF (UART1 resumed)");
   }
-}
-
-// ======================= LẬP ĐƯỜNG & LỖI PHIÊN =======================
-bool buildPlan();
-
-void setError(const char* m) {
-  errMsg = m;
-  if (state == ST_RUN || state == ST_CALIB) {
-    laneTracker.onSessionFailed(m);
-  }
-  state = ST_ERR;
-  mopPwm = 0;
-  emergencyStopMotors();
-}
-
-bool buildPlan() {
-  PlanRequest req;
-  req.roomW                   = roomW;
-  req.roomL                   = roomL;
-  req.edgeMm                  = (float)cfgEdge;
-  req.mopWidthMm              = cfgMopWidth;
-  req.overlapPercent          = cfgOverlap;
-  req.robotRadiusMm           = (float)ROBOT_RADIUS_MM;
-  req.robotX                  = px_mm;
-  req.robotY                  = py_mm;
-  req.robotPsiDeg             = psi;
-  req.requestedDirection      = cfgDirection;
-  // Tái sử dụng thông số động học ước lượng có sẵn của firmware (không phải vận tốc đo thực tế)
-  req.nominalLinearSpeedMmS   = ((float)cfgCruise / 255.0f) * V_MAX_MM_S;
-  req.nominalAngularSpeedDegS = ((float)(MIN_TURN_PWM + MAX_TURN_PWM) * 0.5f / 255.0f) * SPIN_MAX_DEG_S;
-  req.laneChangePenaltySec    = PLANNER_DEF_LANE_PENALTY_S;
-
-  PlanError err = CoveragePlanner::generateBestPlan(req, activePlan);
-  if (err != PLAN_OK) {
-    laneTracker.onSessionFailed(planErrorToStr(err));
-    setError(planErrorToStr(err));
-    return false;
-  }
-
-  laneTracker.beginSession(&activePlan);
-  return true;
-}
-
-// ======================= ĐIỀU HƯỚNG =======================
-void finishCleaning() {
-  mopPwm = 0;
-  emergencyStopMotors();
-  laneTracker.onSessionFinished();
-  state = ST_DONE;
-  Serial.printf("Ket thuc phien: %s\n", cleaningResultToStr(laneTracker.getResult()));
-}
-
-void runNav(bool sensorTick) {
-  if (!activePlan.valid || stepIdx >= (int)activePlan.stepCount) {
-    finishCleaning();
-    return;
-  }
-  const Step &s = activePlan.steps[stepIdx];
-
-  if (!stepStarted) {
-    if (s.purpose == CLEAN_LANE) {
-      laneTracker.onLaneStarted(s.laneId);
-    }
-    float cur = (s.type == GO_X) ? px_mm : py_mm;
-    if (fabsf(s.val - cur) < 30.0f) {
-      if (s.purpose == CLEAN_LANE) {
-        laneTracker.onLaneCompleted(s.laneId);
-      }
-      stepIdx++;
-      stepRetries = 0;
-      return;
-    }
-    if (s.type == GO_X) tgtHeading = (s.val > px_mm) ? 90.0f : 270.0f;
-    else                tgtHeading = (s.val > py_mm) ? 0.0f  : 180.0f;
-    stepStarted = true;
-    phase = PH_TURN;
-    stepStartMs = millis();
-    blockCount = 0;
-  }
-
-  // Pha lùi ngắn sẵn có khi chuyển làn bị vướng mép vật cản
-  if (phase == PH_BACKOFF) {
-    if (millis() < backoffUntilMs) {
-      drive(-SLOW_PWM, -SLOW_PWM);
-      return;
-    }
-    emergencyStopMotors();
-    stepStarted = false;  // Thử định hướng và chạy lại bước CHANGE_LANE
-    return;
-  }
-
-  float err = wrap180(tgtHeading - psi);
-
-  if (phase == PH_TURN) {
-    if (fabsf(err) < TURN_TOL_DEG) { phase = PH_DRIVE; stopMotors(); blockCount = 0; return; }
-    if (millis() - stepStartMs > 15000) {
-      emergencyStopMotors();
-      stepStarted = false;
-      stepRetries = 0;
-      if (s.purpose == CLEAN_LANE) {
-        laneTracker.onLaneFailed(s.laneId, px_mm, py_mm, "Timeout xoay");
-        stepIdx++;
-      } else {
-        // Không chuyển làn / tiếp cận thành công -> dừng phiên để tránh chạy sai làn
-        laneTracker.onChangeLaneFailed("Timeout xoay chuyen lan");
-        setError("Timeout xoay chuyen lan");
-      }
-      return;
-    }
-    int t = (int)fabsf(err * KT);
-    t = clampi(t, MIN_TURN_PWM, MAX_TURN_PWM);
-    if (err > 0) drive(t, -t); else drive(-t, t);
-    return;
-  }
-
-  // PH_DRIVE
-  if (s.purpose == CLEAN_LANE) {
-    laneTracker.updateLaneCovered(s.laneId, px_mm, py_mm);
-  }
-
-  float pos = (s.type == GO_X) ? px_mm : py_mm;
-  bool positive = (tgtHeading == 0.0f || tgtHeading == 90.0f);
-  bool reached = positive ? (pos >= s.val) : (pos <= s.val);
-
-  // Chỉ đếm vật cản khi có mẫu cảm biến mới (không đếm theo tốc độ loop)
-  if (sensorTick) {
-    if (frontBlockedRaw()) blockCount++;
-    else blockCount = 0;
-  }
-  bool blocked = (blockCount >= BLOCK_CONFIRM_CNT);
-
-  if (reached) {
-    if (s.purpose == CLEAN_LANE) {
-      laneTracker.onLaneCompleted(s.laneId);
-    }
-    stopMotors();
-    stepIdx++;
-    stepStarted = false;
-    stepRetries = 0;
-    return;
-  }
-
-  if (blocked) {
-    emergencyStopMotors();
-    blockCount = 0;
-
-    // Bước chuyển làn (CHANGE_LANE): dùng cơ chế retry sẵn có 1 lần;
-    // nếu vẫn thất bại -> dừng phiên an toàn thay vì lau sai vị trí làn.
-    if (s.purpose == CHANGE_LANE) {
-      if (stepRetries == 0) {
-        stepRetries = 1;
-        phase = PH_BACKOFF;
-        backoffUntilMs = millis() + 450;
-        Serial.println("Vat can khi chuyen lan -> lui nhe thu lai");
-        return;
-      }
-      laneTracker.onChangeLaneFailed("Vat can khi chuyen lan");
-      setError("Khong chuyen duoc sang lan ke tiep");
-      return;
-    }
-
-    if (s.purpose == APPROACH_START) {
-      laneTracker.onSessionFailed("Vat can khi tiep can diem bat dau");
-      setError("Khong tiep can duoc diem bat dau");
-      return;
-    }
-
-    // Bước lau làn (CLEAN_LANE): Skip and Record (ghi nhận BLOCKED hoặc PARTIAL)
-    laneTracker.onLaneBlocked(s.laneId, px_mm, py_mm, "Gap vat can");
-    stepIdx++;
-    stepStarted = false;
-    stepRetries = 0;
-    Serial.printf("Lan %d bi can -> %s\n", (int)s.laneId,
-                  laneStatusToStr(activePlan.lanes[s.laneId].status));
-    return;
-  }
-
-  float remain = fabsf(s.val - pos);
-  int base = (remain < 300.0f) ? SLOW_PWM : cfgCruise;
-  int corr = (int)(KH * err);
-  corr = clampi(corr, -60, 60);
-
-  // Chỉ né vật cản hông nếu đó không phải bức tường biên theo kế hoạch
-  float leftWallGap, rightWallGap;
-  expectedSideClearance(tgtHeading, leftWallGap, rightWallGap);
-  if (us[1] < SIDE_NEAR_MM && leftWallGap  > SIDE_NEAR_MM + 40.0f) corr += 25;
-  if (us[2] < SIDE_NEAR_MM && rightWallGap > SIDE_NEAR_MM + 40.0f) corr -= 25;
-
-  drive(base + corr, base - corr);
-
-  if (fabsf(err) > 25.0f) phase = PH_TURN;
-}
-
-// ======================= LỆNH ĐIỀU KHIỂN =======================
-void startCleaning() {
-  if (unoFlashMode) return;
-  memset(&activePlan, 0, sizeof(activePlan));
-  laneTracker.reset();
-  resetCalibration();
-  haveRoom = false; errMsg = "";
-  manualUntil = 0; mopPwm = 0;
-  resetNavigationState();
-  emergencyStopMotors();
-  state = ST_CALIB;
-  Serial.println("Bat dau hieu chinh...");
-}
-
-void stopAll() {
-  if (state == ST_RUN || state == ST_CALIB) {
-    laneTracker.onUserAborted();
-  }
-  mopPwm = 0;
-  manualUntil = 0;
-  state = ST_IDLE;
-  emergencyStopMotors();
 }
 
 // ======================= WEB SERVER =======================

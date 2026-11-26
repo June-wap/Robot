@@ -4,9 +4,7 @@
 #include "../core/MathUtils.h"
 #include "../core/RobotContext.h"
 #include "../core/RobotTypes.h"
-
-extern void startCleaning();
-extern void stopAll();
+#include "../navigation/CleaningSession.h"
 
 void applyCmd(const String& c, int v) {
   if (gRobot.unoFlashMode) return;
