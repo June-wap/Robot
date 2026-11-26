@@ -1,29 +1,29 @@
 #ifndef NETWORK_CONFIG_H
 #define NETWORK_CONFIG_H
 
-// Tùy chọn nạp thông tin mạng nội bộ từ Secrets.h (bị bỏ qua bởi .gitignore)
-// để có thể ghi đè credentials cục bộ mà không sửa mã nguồn chia sẻ.
+// Nạp thông tin mạng / OTA thực tế từ Secrets.h (file cục bộ, bị loại trừ bởi .gitignore).
+// Sao chép Secrets.h.example -> Secrets.h và điền thông tin thực tế trước khi nạp firmware.
 #if defined(__has_include)
 #if __has_include("Secrets.h")
 #include "Secrets.h"
 #endif
 #endif
 
-// ======================= WIFI & OTA =======================
+// ======================= WIFI & OTA (Placeholder mặc định khi chưa có Secrets.h) =======================
 #ifndef WIFI_SSID
-#define WIFI_SSID  "Ngoc Tram_2G"
+#define WIFI_SSID     "CHANGE_ME_WIFI_SSID"
 #endif
 
 #ifndef WIFI_PASS
-#define WIFI_PASS  "trungkien"
+#define WIFI_PASS     "CHANGE_ME_WIFI_PASS"
 #endif
 
 #ifndef AP_SSID
-#define AP_SSID    "RobotLauNha"
+#define AP_SSID       "RobotLauNha"
 #endif
 
 #ifndef AP_PASS
-#define AP_PASS    "88888888"
+#define AP_PASS       "CHANGE_ME_AP_PASS"
 #endif
 
 #ifndef MDNS_HOSTNAME
@@ -35,7 +35,7 @@
 #endif
 
 #ifndef OTA_PASSWORD
-#define OTA_PASSWORD  "robot1234"
+#define OTA_PASSWORD  "CHANGE_ME_OTA_PASS"
 #endif
 
 #endif // NETWORK_CONFIG_H
