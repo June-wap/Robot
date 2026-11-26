@@ -38,7 +38,6 @@
 #include <WebServer.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
-#include <Preferences.h>
 #include <math.h>
 #include <stdlib.h>
 #include "src/planning/LaneTypes.h"
@@ -47,17 +46,48 @@
 #include "src/config/HardwareConfig.h"
 #include "src/config/RobotConfig.h"
 #include "src/config/NetworkConfig.h"
+#include "src/config/Settings.h"
 #include "src/core/RobotTypes.h"
+#include "src/core/RobotContext.h"
 #include "src/core/MathUtils.h"
 #include "src/web/WebPage.h"
 
 // ======================= BIẾN TOÀN CỤC =======================
 WebServer server(80);
-State state = ST_IDLE;
 
-CoveragePlan activePlan;
-LaneTracker  laneTracker;
-int  stepIdx = 0;
+// Tham chiếu tạm tới RobotContext trong quá trình tách dần từng module (không tạo bản sao)
+static State& state = gRobot.state;
+static CoveragePlan& activePlan = gRobot.activePlan;
+static LaneTracker& laneTracker = gRobot.laneTracker;
+static int& stepIdx = gRobot.stepIdx;
+static float& px_mm = gRobot.px_mm;
+static float& py_mm = gRobot.py_mm;
+static float& psi = gRobot.psi;
+static float& roomW = gRobot.roomW;
+static float& roomL = gRobot.roomL;
+static bool& haveRoom = gRobot.haveRoom;
+static uint16_t (&scan)[360] = gRobot.scan;
+static volatile bool& newScan = gRobot.newScan;
+static unsigned long& lastScanMs = gRobot.lastScanMs;
+static uint16_t (&us)[3] = gRobot.us;
+static bool& newUsFront = gRobot.newUsFront;
+static int& cmdL = gRobot.cmdL;
+static int& cmdR = gRobot.cmdR;
+static int& outL = gRobot.outL;
+static int& outR = gRobot.outR;
+static int& mopPwm = gRobot.mopPwm;
+static unsigned long& manualUntil = gRobot.manualUntil;
+static int& manualL = gRobot.manualL;
+static int& manualR = gRobot.manualR;
+static bool& unoFlashMode = gRobot.unoFlashMode;
+static String& errMsg = gRobot.errMsg;
+static float& cfgMopWidth = gRobot.cfgMopWidth;
+static int& cfgCruise = gRobot.cfgCruise;
+static int& cfgEdge = gRobot.cfgEdge;
+static float& cfgOverlap = gRobot.cfgOverlap;
+static CleaningDirection& cfgDirection = gRobot.cfgDirection;
+static String& myIP = gRobot.myIP;
+
 bool stepStarted = false;
 Phase phase = PH_TURN;
 float tgtHeading = 0;
@@ -65,17 +95,11 @@ unsigned long stepStartMs = 0;
 unsigned long backoffUntilMs = 0;
 uint8_t stepRetries = 0;
 
-float px_mm = 0, py_mm = 0, psi = 0;
-float roomW = 0, roomL = 0;
-bool  haveRoom = false;
 unsigned long lastPoseMs = 0;
 
 // LiDAR
 uint16_t acc[360];
-uint16_t scan[360];
-volatile bool newScan = false;
 float lastStartAngle = 0;
-unsigned long lastScanMs = 0;
 uint8_t crcTable[256];
 
 // Siêu âm Non-blocking (ngắt ngoài + lọc trung vị 3 mẫu)
@@ -84,19 +108,15 @@ volatile uint32_t usWidthUs[3] = {0, 0, 0};
 volatile bool     usHigh[3]    = {false, false, false};
 volatile bool     usDone[3]    = {false, false, false};
 
-uint16_t us[3] = {9999, 9999, 9999};
 uint16_t usHist[3][3] = {{9999, 9999, 9999}, {9999, 9999, 9999}, {9999, 9999, 9999}};
 uint8_t  usHistIdx[3] = {0, 0, 0};
 int      usTurn = 0;
 bool     usBusy = false;
 unsigned long lastUsMs = 0;
 unsigned long usTrigMs = 0;
-bool     newUsFront = false;
 
-// Điều khiển động cơ (target vs output thực tế qua soft-start)
-int cmdL = 0, cmdR = 0;
-int outL = 0, outR = 0;
-int mopPwm = 0, lastSentMop = -1;
+// Điều khiển động cơ & liên kết UART
+int lastSentMop = -1;
 unsigned long lastSendMs = 0, lastMopMs = 0, lastTelMs = 0;
 int blockCount = 0;
 
@@ -104,24 +124,6 @@ int blockCount = 0;
 int calibOk = 0, calibFail = 0;
 float calibD[4] = {0, 0, 0, 0};
 float calibSin = 0, calibCos = 0;
-
-// Điều khiển tay
-unsigned long manualUntil = 0;
-int manualL = 0, manualR = 0;
-
-// Chế độ nhả chân GPIO18/19 (High-Z) để nạp code Arduino Uno qua USB
-bool unoFlashMode = false;
-
-String errMsg = "";
-
-// Cài đặt lưu trong Flash (NVS)
-Preferences prefs;
-float cfgMopWidth = DEF_MOP_WIDTH_MM;
-int   cfgCruise   = DEF_CRUISE_PWM;
-int   cfgEdge     = DEF_EDGE_MM;
-float cfgOverlap  = DEF_OVERLAP_PCT;
-CleaningDirection cfgDirection = DIRECTION_AUTO;
-String myIP = "";
 
 // ======================= ĐIỀU KHIỂN ĐỘNG CƠ =======================
 
@@ -799,48 +801,7 @@ void pollLink() {
   }
 }
 
-// ---- Cài đặt lưu trong Flash ----
-bool parseStrictFloat(const String& str, float& out) {
-  if (str.length() == 0) return false;
-  char* endp = nullptr;
-  float v = strtof(str.c_str(), &endp);
-  if (endp == str.c_str() || *endp != '\0' || !isfinite(v)) return false;
-  out = v;
-  return true;
-}
-
-bool parseStrictInt(const String& str, int& out) {
-  if (str.length() == 0) return false;
-  char* endp = nullptr;
-  long v = strtol(str.c_str(), &endp, 10);
-  if (endp == str.c_str() || *endp != '\0') return false;
-  if (v < -32768L || v > 32767L) return false;
-  out = (int)v;
-  return true;
-}
-
-bool parseDirectionArg(const String& str, CleaningDirection& out) {
-  if (str == "AUTO" || str == "auto" || str == "0") { out = DIRECTION_AUTO; return true; }
-  if (str == "X"    || str == "x"    || str == "1") { out = DIRECTION_X;    return true; }
-  if (str == "Y"    || str == "y"    || str == "2") { out = DIRECTION_Y;    return true; }
-  return false;
-}
-
-void loadSettings() {
-  prefs.begin("robot", true);
-  cfgMopWidth = clampf(prefs.getFloat("mop", DEF_MOP_WIDTH_MM), 100.0f, 400.0f);
-  cfgCruise   = clampi(prefs.getInt("cruise", DEF_CRUISE_PWM), 100, MAX_SAFE_PWM);
-  cfgEdge     = clampi(prefs.getInt("edge", DEF_EDGE_MM), ROBOT_RADIUS_MM + 10, 500);
-  cfgOverlap  = clampf(prefs.getFloat("overlap", DEF_OVERLAP_PCT), MIN_OVERLAP_PERCENT, MAX_OVERLAP_PERCENT);
-  int dirInt  = prefs.getInt("dir", (int)DIRECTION_AUTO);
-  if (dirInt >= (int)DIRECTION_AUTO && dirInt <= (int)DIRECTION_Y) {
-    cfgDirection = (CleaningDirection)dirInt;
-  } else {
-    cfgDirection = DIRECTION_AUTO;
-  }
-  prefs.end();
-}
-
+// ---- Cài đặt lưu trong Flash (đã tách sang Settings) ----
 void handleSettings() {
   bool hasAny = server.hasArg("mop") || server.hasArg("cruise") ||
                 server.hasArg("edge") || server.hasArg("overlap") ||
@@ -895,13 +856,7 @@ void handleSettings() {
     cfgOverlap   = newOverlap;
     cfgDirection = newDir;
 
-    prefs.begin("robot", false);
-    prefs.putFloat("mop", cfgMopWidth);
-    prefs.putInt("cruise", cfgCruise);
-    prefs.putInt("edge", cfgEdge);
-    prefs.putFloat("overlap", cfgOverlap);
-    prefs.putInt("dir", (int)cfgDirection);
-    prefs.end();
+    saveSettings();
   }
 
   char b[160];
